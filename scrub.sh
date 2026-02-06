@@ -27,8 +27,15 @@ GRUB_CFG="/boot/grub2/grub.cfg"
 BACKUP_ROOT="/var/backups/scrub-ghost"
 
 # Mode
-ACTION="scan"  # scan | list-backups | restore
+ACTION="scan"  # scan | list-backups | restore | validate
 RESTORE_FROM=""
+RESTORE_PICK=""        # 1 = newest, 2 = second newest, etc.
+RESTORE_ANYWAY=false
+RESTORE_BEST=false
+
+# Output
+COLOR=true
+VERBOSE=false
 
 # Verification / pruning knobs
 VERIFY_SNAPSHOTS=true
@@ -65,11 +72,21 @@ Options:
   --boot-dir DIR         Root dir used to resolve BLS paths (default: derived from entries dir)
   --rebuild-grub         Run grub2-mkconfig after changes
   --grub-cfg PATH        Output path for grub2-mkconfig (default: /boot/grub2/grub.cfg)
+  --no-color             Disable colored output
+  --verbose              Print extra details (including validation failures in --list-backups)
 
 Easy restore:
-  --list-backups         List backup folders under backup root
-  --restore-latest       Restore BLS entries from the latest backup (replaces current *.conf)
-  --restore-from DIR     Restore BLS entries from a specific backup directory
+  --list-backups         List backup folders under backup root (numbered)
+  --restore-latest       Restore BLS entries from the latest backup (validated)
+  --restore-pick N       Restore from backup number N shown by --list-backups (validated)
+  --restore-best         Restore from the newest backup that passes validation
+  --restore-from DIR     Restore BLS entries from a specific backup directory (validated)
+  --restore-anyway       Override failed validation (dangerous)
+
+Validation only (no changes):
+  --validate-latest      Validate latest backup without restoring
+  --validate-pick N      Validate backup number N shown by --list-backups
+  --validate-from DIR    Validate a specific backup without restoring
 
 Backup (runs automatically on --force/--delete):
   --no-backup             Do not create a filesystem backup copy of entries before changes
@@ -88,14 +105,45 @@ Examples:
   sudo ./scrub.sh
   sudo ./scrub.sh --force --prune-stale-snapshots
   sudo ./scrub.sh --list-backups
-  sudo ./scrub.sh --restore-latest
+  sudo ./scrub.sh --validate-latest
+  sudo ./scrub.sh --restore-pick 2
+  sudo ./scrub.sh --restore-best
   sudo ./scrub.sh --restore-from /var/backups/scrub-ghost/bls-entries-YYYYMMDD-HHMMSS
 USAGE
 }
 
-log() { printf '%s\n' "$*"; }
-warn() { printf 'WARN: %s\n' "$*"; }
-err() { printf 'ERROR: %s\n' "$*" >&2; }
+C_RESET=""
+C_BOLD=""
+C_RED=""
+C_GREEN=""
+C_YELLOW=""
+C_BLUE=""
+C_DIM=""
+
+init_colors() {
+  # Enable colors only when stdout is a TTY and the user hasn't disabled it.
+  if [[ "$COLOR" != true ]]; then
+    return 0
+  fi
+  if [[ ! -t 1 ]]; then
+    return 0
+  fi
+  if [[ -n "${NO_COLOR:-}" ]]; then
+    return 0
+  fi
+
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+}
+
+log() { printf '%b\n' "$*"; }
+warn() { printf '%bWARN:%b %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+err() { printf '%bERROR:%b %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 
 ts_now() { date +%Y%m%d-%H%M%S; }
 
@@ -109,6 +157,14 @@ latest_backup_dir() {
   ls -1dt "$BACKUP_ROOT"/bls-entries-* 2>/dev/null | head -n 1 || true
 }
 
+pick_nth_backup_dir() {
+  local n="$1"
+  [[ "$n" =~ ^[0-9]+$ ]] || return 1
+  [[ "$n" -ge 1 ]] || return 1
+
+  ls -1dt "$BACKUP_ROOT"/bls-entries-* 2>/dev/null | sed -n "${n}p" || true
+}
+
 list_backups() {
   mkdir -p -- "$BACKUP_ROOT" 2>/dev/null || true
   if ! ls -1d "$BACKUP_ROOT"/bls-entries-* >/dev/null 2>&1; then
@@ -117,17 +173,163 @@ list_backups() {
   fi
 
   log "Backups under: $BACKUP_ROOT"
-  ls -1dt "$BACKUP_ROOT"/bls-entries-* 2>/dev/null | while IFS= read -r d; do
-    local when
-    when="$(basename -- "$d")"
+  log "(Use: --restore-pick N or --validate-pick N)"
+  log "${C_DIM}GREEN = recommended (passes validation). RED = old/bad (fails validation).${C_RESET}"
+  if [[ "$VERBOSE" == false ]]; then
+    log "${C_DIM}(Tip: add --verbose to show why a backup is marked OLD.)${C_RESET}"
+  fi
+
+  local i=1
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+
     local count
     count="$(ls -1 "$d"/full/*.conf 2>/dev/null | wc -l || true)"
+
+    local sid=""
+    local mid=""
     if [[ -f "$d/manifest.txt" ]]; then
-      log "- $d (full entries: $count)"
+      sid="$(awk -F= '$1=="snapper_backup_id" {print $2; exit}' "$d/manifest.txt" 2>/dev/null || true)"
+      mid="$(awk -F= '$1=="machine_id" {print $2; exit}' "$d/manifest.txt" 2>/dev/null || true)"
+    fi
+
+    local extra=""
+    [[ -n "$sid" ]] && extra+=" snapper=#$sid"
+    [[ -n "$mid" ]] && extra+=" machine_id=${mid:0:8}…"
+
+    local status_tag=""
+    local status_color="$C_GREEN"
+    if [[ "$VERBOSE" == true ]]; then
+      if validate_backup_bootability "$d"; then
+        status_tag="[OK]"
+        status_color="$C_GREEN"
+      else
+        status_tag="[OLD]"
+        status_color="$C_RED"
+      fi
     else
-      log "- $d (full entries: $count; no manifest)"
+      if validate_backup_bootability "$d" >/dev/null 2>&1; then
+        status_tag="[OK]"
+        status_color="$C_GREEN"
+      else
+        status_tag="[OLD]"
+        status_color="$C_RED"
+      fi
+    fi
+
+    if [[ -f "$d/manifest.txt" ]]; then
+      log "${status_color}${status_tag}${C_RESET} $i) $d (full entries: $count)$extra"
+    else
+      log "${status_color}${status_tag}${C_RESET} $i) $d (full entries: $count; no manifest)"
+    fi
+
+    i=$((i + 1))
+  done < <(ls -1dt "$BACKUP_ROOT"/bls-entries-* 2>/dev/null)
+}
+
+validate_backup_structure() {
+  # Integrity check: backup looks like a backup (not necessarily bootable).
+  local src="$1"
+  [[ -d "$src" ]] || return 1
+  [[ -d "$src/full" ]] || return 1
+  compgen -G "$src/full/*.conf" >/dev/null || return 1
+
+  local bad=0
+  for f in "$src"/full/*.conf; do
+    local kp
+    kp="$(awk '$1 ~ /^linux(efi)?$/ {print $2; exit}' "$f" 2>/dev/null || true)"
+    if [[ -z "$kp" ]]; then
+      bad=$((bad + 1))
     fi
   done
+
+  [[ "$bad" -eq 0 ]]
+}
+
+validate_backup_bootability() {
+  # Strong validation: try to ensure the restored set won't obviously be broken.
+  # Checks:
+  # - each entry has linux path and it exists now
+  # - initrd (if present) exists now
+  # - snapper snapshots referenced still exist (if verification enabled)
+  # - machine-id match if manifest provides it
+  local src="$1"
+
+  if ! validate_backup_structure "$src"; then
+    err "validate: backup structure invalid: $src"
+    return 1
+  fi
+
+  local this_mid=""
+  if [[ -f /etc/machine-id ]]; then
+    this_mid="$(tr -d '\n' </etc/machine-id 2>/dev/null || true)"
+  fi
+
+  local manifest_mid=""
+  if [[ -f "$src/manifest.txt" ]]; then
+    manifest_mid="$(awk -F= '$1=="machine_id" {print $2; exit}' "$src/manifest.txt" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$manifest_mid" && -n "$this_mid" && "$manifest_mid" != "$this_mid" ]]; then
+    err "validate: machine-id mismatch (backup is from a different install)"
+    err "validate: this=$this_mid backup=$manifest_mid"
+    return 1
+  fi
+
+  local missing_kernel=0
+  local missing_initrd=0
+  local missing_snapshot=0
+
+  for f in "$src"/full/*.conf; do
+    local kp
+    kp="$(awk '$1 ~ /^linux(efi)?$/ {print $2; exit}' "$f" 2>/dev/null || true)"
+    local kfull
+    kfull="$(resolve_boot_path "$kp" || true)"
+    if [[ -z "$kfull" || ! -e "$kfull" ]]; then
+      missing_kernel=$((missing_kernel + 1))
+    fi
+
+    local ip
+    ip="$(awk '$1=="initrd" {print $2; exit}' "$f" 2>/dev/null || true)"
+    if [[ -n "$ip" ]]; then
+      local ifull
+      ifull="$(resolve_boot_path "$ip" || true)"
+      if [[ -z "$ifull" || ! -e "$ifull" ]]; then
+        missing_initrd=$((missing_initrd + 1))
+      fi
+    fi
+
+    if [[ "$VERIFY_SNAPSHOTS" == true ]]; then
+      local sn
+      sn="$(snapshot_num_from_entry "$f")"
+      if [[ -n "$sn" ]]; then
+        if ! snapshot_exists "$sn"; then
+          missing_snapshot=$((missing_snapshot + 1))
+        fi
+      fi
+    fi
+  done
+
+  if [[ "$missing_kernel" -ne 0 || "$missing_initrd" -ne 0 || "$missing_snapshot" -ne 0 ]]; then
+    err "validate: failed: missing kernel=$missing_kernel initrd=$missing_initrd snapshots=$missing_snapshot"
+    return 1
+  fi
+
+  return 0
+}
+
+pick_best_backup_dir() {
+  # Choose newest backup that passes bootability validation.
+  local d
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    if validate_backup_bootability "$d"; then
+      printf '%s\n' "$d"
+      return 0
+    fi
+  done < <(ls -1dt "$BACKUP_ROOT"/bls-entries-* 2>/dev/null)
+
+  return 1
 }
 
 restore_entries_from_backup() {
@@ -140,9 +342,19 @@ restore_entries_from_backup() {
     err "restore: backup dir not found: $src"
     exit 1
   fi
-  if ! compgen -G "$src/full/*.conf" >/dev/null; then
-    err "restore: no 'full/*.conf' found in: $src"
+
+  if ! validate_backup_structure "$src"; then
+    err "restore: invalid backup structure: $src"
     exit 1
+  fi
+
+  if ! validate_backup_bootability "$src"; then
+    if [[ "$RESTORE_ANYWAY" == false ]]; then
+      err "restore blocked: backup failed validation"
+      err "Use --restore-anyway to override"
+      exit 1
+    fi
+    warn "Proceeding despite failed validation (--restore-anyway)"
   fi
 
   # Backup current entries before replacing.
@@ -155,9 +367,27 @@ restore_entries_from_backup() {
     cp -a -- "$ENTRIES_DIR"/*.conf "$pre_dir/" 2>/dev/null || cp -p -- "$ENTRIES_DIR"/*.conf "$pre_dir/"
   fi
 
-  # Replace entries set (clear then copy).
-  rm -f -- "$ENTRIES_DIR"/*.conf 2>/dev/null || true
-  cp -a -- "$src"/full/*.conf "$ENTRIES_DIR/" 2>/dev/null || cp -p -- "$src"/full/*.conf "$ENTRIES_DIR/"
+  # Safer restore strategy:
+  # 1) Copy all files from backup over (overwrite/replace)
+  # 2) Remove any extra .conf files not present in the backup set
+  declare -A wanted
+  local bf
+  for bf in "$src"/full/*.conf; do
+    local base
+    base="$(basename -- "$bf")"
+    wanted["$base"]=1
+    cp -a -- "$bf" "$ENTRIES_DIR/$base" 2>/dev/null || cp -p -- "$bf" "$ENTRIES_DIR/$base"
+  done
+
+  local cur
+  for cur in "$ENTRIES_DIR"/*.conf; do
+    [[ -e "$cur" ]] || continue
+    local base
+    base="$(basename -- "$cur")"
+    if [[ -z "${wanted[$base]+x}" ]]; then
+      rm -f -- "$cur"
+    fi
+  done
 
   log "Restore complete."
   log "- Restored from: $src"
@@ -261,6 +491,12 @@ fi
 # Argument parsing
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --verbose)
+      VERBOSE=true
+      ;;
+    --no-color)
+      COLOR=false
+      ;;
     --dry-run)
       DRY_RUN=true
       ;;
@@ -304,8 +540,35 @@ while [[ $# -gt 0 ]]; do
       ACTION="restore"
       RESTORE_FROM="__LATEST__"
       ;;
+    --restore-pick)
+      ACTION="restore"
+      shift
+      RESTORE_PICK="${1:-}"
+      ;;
+    --restore-best)
+      ACTION="restore"
+      RESTORE_BEST=true
+      ;;
     --restore-from)
       ACTION="restore"
+      shift
+      RESTORE_FROM="${1:-}"
+      ;;
+    --restore-anyway)
+      RESTORE_ANYWAY=true
+      ;;
+
+    --validate-latest)
+      ACTION="validate"
+      RESTORE_FROM="__LATEST__"
+      ;;
+    --validate-pick)
+      ACTION="validate"
+      shift
+      RESTORE_PICK="${1:-}"
+      ;;
+    --validate-from)
+      ACTION="validate"
       shift
       RESTORE_FROM="${1:-}"
       ;;
@@ -361,28 +624,6 @@ if [[ -z "$ENTRIES_DIR" || ! -d "$ENTRIES_DIR" ]]; then
   exit 1
 fi
 
-# Handle non-scan actions early (after we know ENTRIES_DIR).
-if [[ "$ACTION" == "list-backups" ]]; then
-  list_backups
-  exit 0
-fi
-
-if [[ "$ACTION" == "restore" ]]; then
-  mkdir -p -- "$BACKUP_ROOT" 2>/dev/null || true
-
-  if [[ "$RESTORE_FROM" == "__LATEST__" ]]; then
-    RESTORE_FROM="$(latest_backup_dir)"
-  fi
-
-  if [[ -z "$RESTORE_FROM" ]]; then
-    err "restore: no backup found (use --list-backups)"
-    exit 1
-  fi
-
-  restore_entries_from_backup "$RESTORE_FROM"
-  exit 0
-fi
-
 if [[ "$BOOT_DIR_SET" == false ]]; then
   BOOT_DIR="$(dirname "$(dirname "$ENTRIES_DIR")")"
 fi
@@ -391,8 +632,60 @@ if [[ ! -d "$BOOT_DIR" ]]; then
   warn "Boot root dir not found: $BOOT_DIR (path checks may be wrong)"
 fi
 
+# Initialize colors once we parsed flags.
+init_colors
+
 if [[ "$VERIFY_SNAPSHOTS" == true ]]; then
   load_snapper_snapshot_set
+fi
+
+# Handle non-scan actions after BOOT_DIR and snapper set are ready.
+if [[ "$ACTION" == "list-backups" ]]; then
+  list_backups
+  exit 0
+fi
+
+if [[ "$ACTION" == "validate" ]]; then
+  mkdir -p -- "$BACKUP_ROOT" 2>/dev/null || true
+
+  if [[ -n "$RESTORE_PICK" ]]; then
+    RESTORE_FROM="$(pick_nth_backup_dir "$RESTORE_PICK" || true)"
+  elif [[ "$RESTORE_FROM" == "__LATEST__" ]]; then
+    RESTORE_FROM="$(latest_backup_dir)"
+  fi
+
+  if [[ -z "$RESTORE_FROM" ]]; then
+    err "validate: no backup found (use --list-backups)"
+    exit 1
+  fi
+
+  if validate_backup_bootability "$RESTORE_FROM"; then
+    log "Backup validation OK: $RESTORE_FROM"
+    exit 0
+  else
+    err "Backup validation FAILED: $RESTORE_FROM"
+    exit 1
+  fi
+fi
+
+if [[ "$ACTION" == "restore" ]]; then
+  mkdir -p -- "$BACKUP_ROOT" 2>/dev/null || true
+
+  if [[ -n "$RESTORE_PICK" ]]; then
+    RESTORE_FROM="$(pick_nth_backup_dir "$RESTORE_PICK" || true)"
+  elif [[ "$RESTORE_BEST" == true ]]; then
+    RESTORE_FROM="$(pick_best_backup_dir || true)"
+  elif [[ "$RESTORE_FROM" == "__LATEST__" ]]; then
+    RESTORE_FROM="$(latest_backup_dir)"
+  fi
+
+  if [[ -z "$RESTORE_FROM" ]]; then
+    err "restore: no suitable backup found (use --list-backups)"
+    exit 1
+  fi
+
+  restore_entries_from_backup "$RESTORE_FROM"
+  exit 0
 fi
 
 log "========================================"
@@ -457,6 +750,9 @@ backup_entries_tree() {
     echo "entries_dir=$ENTRIES_DIR"
     echo "boot_dir=$BOOT_DIR"
     echo "delete_mode=$DELETE_MODE"
+    if [[ -f /etc/machine-id ]]; then
+      echo "machine_id=$(tr -d '\n' </etc/machine-id 2>/dev/null || true)"
+    fi
     if [[ -n "$SNAPPER_BACKUP_ID" ]]; then
       echo "snapper_backup_id=$SNAPPER_BACKUP_ID"
     fi
@@ -487,7 +783,13 @@ if [[ "$DRY_RUN" == false ]]; then
   fi
   if [[ "$AUTO_BACKUP" == true ]]; then
     backup_entries_tree
-    log "Entry backup saved to: $BACKUP_DIR"
+    if validate_backup_structure "$BACKUP_DIR"; then
+      log "Entry backup saved to: $BACKUP_DIR"
+    else
+      err "Backup integrity check failed; refusing to proceed with cleanup"
+      err "(pass --no-backup if you really want to run without backups)"
+      exit 1
+    fi
   fi
 fi
 
@@ -552,7 +854,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
     # Kernel image exists, but we may still want to flag stale snapper/uninstalled kernels.
     if [[ -n "$snap_num" && "$VERIFY_SNAPSHOTS" == true && "$snap_present" == false ]]; then
       stale_snapshot_count=$((stale_snapshot_count + 1))
-      log "[STALE-SNAPSHOT] $(basename -- "$entry") (snapshot #$snap_num not present)"
+      log "${C_RED}[STALE-SNAPSHOT]${C_RESET} $(basename -- "$entry") ${C_DIM}(snapshot #$snap_num not present)${C_RESET}"
 
       if [[ "$DRY_RUN" == true || "$PRUNE_STALE_SNAPSHOTS" == false ]]; then
         continue
@@ -572,7 +874,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
 
     if [[ "$modules_present" == false ]]; then
       uninstalled_kernel_count=$((uninstalled_kernel_count + 1))
-      log "[UNINSTALLED-KERNEL] $(basename -- "$entry") (modules missing for ${kver:-unknown})"
+      log "${C_YELLOW}[UNINSTALLED-KERNEL]${C_RESET} $(basename -- "$entry") ${C_DIM}(modules missing for ${kver:-unknown})${C_RESET}"
 
       if [[ "$PRUNE_UNINSTALLED_KERNELS" == true && "$CONFIRM_PRUNE_UNINSTALLED" == false ]]; then
         log "        note:    pruning requires --confirm-uninstalled (extra safety flag)"
@@ -593,7 +895,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
       continue
     fi
 
-    log "[OK]   $(basename -- "$entry")"
+    log "${C_GREEN}[OK]${C_RESET}   $(basename -- "$entry")"
     ok_count=$((ok_count + 1))
     continue
   fi
@@ -602,7 +904,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   ghost_count=$((ghost_count + 1))
 
   log ""
-  log "[GHOST] $(basename -- "$entry")"
+  log "${C_RED}[GHOST]${C_RESET} $(basename -- "$entry")"
   log "        linux:   $kernel_path"
   log "        lookup:  $kernel_full"
 
@@ -612,7 +914,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
     else
       log "        note:    references existing snapshot"
     fi
-    log "        action:  SKIP (protected snapshot entry)"
+    log "        action:  ${C_BLUE}SKIP${C_RESET} (protected snapshot entry)"
     protected_count=$((protected_count + 1))
     continue
   fi
