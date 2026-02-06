@@ -37,6 +37,15 @@ RESTORE_BEST=false
 COLOR=true
 VERBOSE=false
 
+# Logging
+DEBUG=false
+LOG_FILE="/var/log/scrub-ghost.log"
+LOG_FILE_SET=false
+
+# Interactive menu
+MENU_REQUESTED=false
+NO_MENU=false
+
 # Verification / pruning knobs
 VERIFY_SNAPSHOTS=true
 VERIFY_KERNEL_MODULES=true
@@ -74,6 +83,11 @@ Options:
   --grub-cfg PATH        Output path for grub2-mkconfig (default: /boot/grub2/grub.cfg)
   --no-color             Disable colored output
   --verbose              Print extra details (including validation failures in --list-backups)
+  --debug                Enable debug logging
+  --log-file PATH         Write logs to PATH (default: /var/log/scrub-ghost.log)
+
+Interactive:
+  --menu                 Start interactive menu
 
 Easy restore:
   --list-backups         List backup folders under backup root (numbered)
@@ -120,6 +134,40 @@ C_YELLOW=""
 C_BLUE=""
 C_DIM=""
 
+log_to_file() {
+  # Best effort: write to LOG_FILE without ANSI codes.
+  [[ -n "$LOG_FILE" ]] || return 0
+
+  # Strip ANSI escapes before writing to file.
+  local line
+  line="$(printf '%b' "$*" | sed -r 's/\x1B\[[0-9;]*[mK]//g')"
+  printf '%s %s\n' "$(date -Is)" "$line" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+init_logging() {
+  # Try requested file first; if not writable, fall back.
+  if [[ -z "$LOG_FILE" ]]; then
+    return 0
+  fi
+
+  local dir
+  dir="$(dirname -- "$LOG_FILE")"
+  mkdir -p -- "$dir" 2>/dev/null || true
+  touch -- "$LOG_FILE" 2>/dev/null || true
+
+  if [[ ! -w "$LOG_FILE" ]]; then
+    # Fall back to BACKUP_ROOT (usually writable as root) then /tmp
+    LOG_FILE="$BACKUP_ROOT/scrub-ghost.log"
+    mkdir -p -- "$BACKUP_ROOT" 2>/dev/null || true
+    touch -- "$LOG_FILE" 2>/dev/null || true
+
+    if [[ ! -w "$LOG_FILE" ]]; then
+      LOG_FILE="/tmp/scrub-ghost.log"
+      touch -- "$LOG_FILE" 2>/dev/null || true
+    fi
+  fi
+}
+
 init_colors() {
   # Enable colors only when stdout is a TTY and the user hasn't disabled it.
   if [[ "$COLOR" != true ]]; then
@@ -141,9 +189,24 @@ init_colors() {
   C_BLUE=$'\033[34m'
 }
 
-log() { printf '%b\n' "$*"; }
-warn() { printf '%bWARN:%b %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
-err() { printf '%bERROR:%b %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+log() {
+  printf '%b\n' "$*"
+  log_to_file "$*"
+}
+warn() {
+  printf '%bWARN:%b %s\n' "$C_YELLOW" "$C_RESET" "$*"
+  log_to_file "WARN: $*"
+}
+err() {
+  printf '%bERROR:%b %s\n' "$C_RED" "$C_RESET" "$*" >&2
+  log_to_file "ERROR: $*"
+}
+debug() {
+  if [[ "$DEBUG" == true ]]; then
+    printf '%bDEBUG:%b %s\n' "$C_BLUE" "$C_RESET" "$*"
+    log_to_file "DEBUG: $*"
+  fi
+}
 
 ts_now() { date +%Y%m%d-%H%M%S; }
 
@@ -357,6 +420,8 @@ restore_entries_from_backup() {
     warn "Proceeding despite failed validation (--restore-anyway)"
   fi
 
+  debug "Restoring entries from '$src' into '$ENTRIES_DIR'"
+
   # Backup current entries before replacing.
   local ts
   ts="$(ts_now)"
@@ -488,11 +553,27 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   exit 1
 fi
 
+ORIG_ARGC=$#
+
 # Argument parsing
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --menu)
+      MENU_REQUESTED=true
+      ;;
+    --no-menu)
+      NO_MENU=true
+      ;;
     --verbose)
       VERBOSE=true
+      ;;
+    --debug)
+      DEBUG=true
+      ;;
+    --log-file)
+      shift
+      LOG_FILE="${1:-}"
+      LOG_FILE_SET=true
       ;;
     --no-color)
       COLOR=false
@@ -632,11 +713,247 @@ if [[ ! -d "$BOOT_DIR" ]]; then
   warn "Boot root dir not found: $BOOT_DIR (path checks may be wrong)"
 fi
 
-# Initialize colors once we parsed flags.
+# Initialize colors/logging once we parsed flags.
 init_colors
+init_logging
+if [[ -n "$LOG_FILE" ]]; then
+  debug "Logging to: $LOG_FILE"
+fi
 
 if [[ "$VERIFY_SNAPSHOTS" == true ]]; then
   load_snapper_snapshot_set
+fi
+
+prompt_enter_to_continue() {
+  # shellcheck disable=SC2162
+  read -r -p "Press Enter to continue..." _ </dev/tty 2>/dev/null || true
+}
+
+build_common_flags() {
+  COMMON_FLAGS=()
+
+  [[ "$COLOR" == false ]] && COMMON_FLAGS+=("--no-color")
+  [[ "$VERBOSE" == true ]] && COMMON_FLAGS+=("--verbose")
+  [[ "$DEBUG" == true ]] && COMMON_FLAGS+=("--debug")
+
+  # Keep log file consistent across invocations
+  if [[ -n "$LOG_FILE" ]]; then
+    COMMON_FLAGS+=("--log-file" "$LOG_FILE")
+  fi
+
+  [[ "$AUTO_BACKUP" == false ]] && COMMON_FLAGS+=("--no-backup")
+  [[ "$AUTO_SNAPPER_BACKUP" == false ]] && COMMON_FLAGS+=("--no-snapper-backup")
+
+  [[ "$VERIFY_SNAPSHOTS" == false ]] && COMMON_FLAGS+=("--no-verify-snapshots")
+  [[ "$VERIFY_KERNEL_MODULES" == false ]] && COMMON_FLAGS+=("--no-verify-modules")
+
+  # Keep using same backup root if user changed it
+  [[ -n "$BACKUP_ROOT" ]] && COMMON_FLAGS+=("--backup-root" "$BACKUP_ROOT")
+
+  # Preserve manual directory overrides if used
+  [[ "$ENTRIES_DIR_SET" == true ]] && COMMON_FLAGS+=("--entries-dir" "$ENTRIES_DIR")
+  [[ "$BOOT_DIR_SET" == true ]] && COMMON_FLAGS+=("--boot-dir" "$BOOT_DIR")
+}
+
+run_sub() {
+  build_common_flags
+  SCRUB_GHOST_NO_MENU=1 bash "$0" --no-menu "${COMMON_FLAGS[@]}" "$@"
+}
+
+menu_header() {
+  log ""
+  log "${C_BOLD}scrub-ghost interactive menu${C_RESET}"
+  log "Entries: $ENTRIES_DIR"
+  log "Boot:    $BOOT_DIR"
+  log "Backup:  $BACKUP_ROOT"
+  log "Log:     ${LOG_FILE:-disabled}"
+  log ""
+}
+
+menu_main() {
+  while true; do
+    menu_header
+    log "1) Scan (dry-run)"
+    log "2) Clean: prune stale Snapper entries (safe move + backups)"
+    log "3) Clean: remove ghosts only (safe move + backups)"
+    log "4) Clean: ghosts + stale Snapper entries (safe move + backups)"
+    log "5) Clean: prune uninstalled-kernel entries (requires confirm flag)"
+    log ""
+    log "6) Backups: list"
+    log "7) Backups: validate (submenu)"
+    log "8) Backups: restore (submenu)"
+    log ""
+    log "9) Settings (submenu)"
+    log "0) Exit"
+    log ""
+
+    local choice
+    read -r -p "> " choice </dev/tty || return 0
+
+    case "$choice" in
+      1)
+        run_sub --dry-run
+        prompt_enter_to_continue
+        ;;
+      2)
+        run_sub --force --prune-stale-snapshots
+        prompt_enter_to_continue
+        ;;
+      3)
+        run_sub --force
+        prompt_enter_to_continue
+        ;;
+      4)
+        run_sub --force --prune-stale-snapshots
+        prompt_enter_to_continue
+        ;;
+      5)
+        log "This will only prune uninstalled-kernel entries if you also pass --confirm-uninstalled."
+        log "Type YES to proceed with prune-uninstalled+confirm:"
+        local yn
+        read -r -p "> " yn </dev/tty || true
+        if [[ "$yn" == "YES" ]]; then
+          run_sub --force --prune-uninstalled --confirm-uninstalled
+        else
+          log "Cancelled."
+        fi
+        prompt_enter_to_continue
+        ;;
+      6)
+        run_sub --list-backups
+        prompt_enter_to_continue
+        ;;
+      7)
+        menu_validate
+        ;;
+      8)
+        menu_restore
+        ;;
+      9)
+        menu_settings
+        ;;
+      0)
+        return 0
+        ;;
+      *)
+        log "Invalid option."
+        prompt_enter_to_continue
+        ;;
+    esac
+  done
+}
+
+menu_validate() {
+  while true; do
+    menu_header
+    log "Validate backups"
+    log "1) Validate latest"
+    log "2) Validate pick number"
+    log "3) Back"
+
+    local choice
+    read -r -p "> " choice </dev/tty || return 0
+
+    case "$choice" in
+      1)
+        run_sub --validate-latest
+        prompt_enter_to_continue
+        ;;
+      2)
+        local n
+        read -r -p "Pick number: " n </dev/tty || true
+        run_sub --validate-pick "$n"
+        prompt_enter_to_continue
+        ;;
+      3)
+        return 0
+        ;;
+      *)
+        log "Invalid option."
+        prompt_enter_to_continue
+        ;;
+    esac
+  done
+}
+
+menu_restore() {
+  while true; do
+    menu_header
+    log "Restore backups (validated)"
+    log "1) Restore latest"
+    log "2) Restore best (newest passing validation)"
+    log "3) Restore pick number"
+    log "4) Back"
+
+    local choice
+    read -r -p "> " choice </dev/tty || return 0
+
+    case "$choice" in
+      1)
+        run_sub --restore-latest
+        prompt_enter_to_continue
+        ;;
+      2)
+        run_sub --restore-best
+        prompt_enter_to_continue
+        ;;
+      3)
+        run_sub --list-backups
+        local n
+        read -r -p "Pick number: " n </dev/tty || true
+        run_sub --restore-pick "$n"
+        prompt_enter_to_continue
+        ;;
+      4)
+        return 0
+        ;;
+      *)
+        log "Invalid option."
+        prompt_enter_to_continue
+        ;;
+    esac
+  done
+}
+
+menu_settings() {
+  while true; do
+    menu_header
+    log "Settings (these affect menu-run commands by passing flags)"
+    log "1) Toggle verbose (currently: $VERBOSE)"
+    log "2) Toggle debug  (currently: $DEBUG)"
+    log "3) Toggle color  (currently: $COLOR)"
+    log "4) Toggle verify snapshots (currently: $VERIFY_SNAPSHOTS)"
+    log "5) Toggle verify modules   (currently: $VERIFY_KERNEL_MODULES)"
+    log "6) Toggle auto backup      (currently: $AUTO_BACKUP)"
+    log "7) Toggle auto snapper     (currently: $AUTO_SNAPPER_BACKUP)"
+    log "8) Back"
+
+    local choice
+    read -r -p "> " choice </dev/tty || return 0
+
+    case "$choice" in
+      1) VERBOSE=$([[ "$VERBOSE" == true ]] && echo false || echo true) ;;
+      2) DEBUG=$([[ "$DEBUG" == true ]] && echo false || echo true) ;;
+      3) COLOR=$([[ "$COLOR" == true ]] && echo false || echo true); init_colors ;;
+      4) VERIFY_SNAPSHOTS=$([[ "$VERIFY_SNAPSHOTS" == true ]] && echo false || echo true) ;;
+      5) VERIFY_KERNEL_MODULES=$([[ "$VERIFY_KERNEL_MODULES" == true ]] && echo false || echo true) ;;
+      6) AUTO_BACKUP=$([[ "$AUTO_BACKUP" == true ]] && echo false || echo true) ;;
+      7) AUTO_SNAPPER_BACKUP=$([[ "$AUTO_SNAPPER_BACKUP" == true ]] && echo false || echo true) ;;
+      8) return 0 ;;
+      *) log "Invalid option." ;;
+    esac
+
+    prompt_enter_to_continue
+  done
+}
+
+# Interactive menu: if requested OR no args and running on a TTY.
+# Uses ORIG_ARGC because we've shifted args during parsing.
+if [[ "$NO_MENU" == false && -z "${SCRUB_GHOST_NO_MENU:-}" ]]; then
+  if [[ "$MENU_REQUESTED" == true || ( "$ORIG_ARGC" -eq 0 && -t 0 && -t 1 ) ]]; then
+    menu_main
+    exit 0
+  fi
 fi
 
 # Handle non-scan actions after BOOT_DIR and snapper set are ready.
