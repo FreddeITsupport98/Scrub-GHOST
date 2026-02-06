@@ -1081,6 +1081,179 @@ menu_danger() {
   done
 }
 
+systemd_install_builtin() {
+  # Installs systemd unit+timer + wrapper. Does NOT enable the timer automatically.
+  # Writes example config only if the user doesn't already have one.
+  local libexec_dir="/usr/local/libexec/scrub-ghost"
+  local wrapper="$libexec_dir/run-systemd"
+
+  mkdir -p -- "$libexec_dir"
+
+  cat >"$wrapper" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if [[ -f /etc/sysconfig/scrub-ghost ]]; then
+  # shellcheck disable=SC1091
+  . /etc/sysconfig/scrub-ghost
+elif [[ -f /etc/default/scrub-ghost ]]; then
+  # shellcheck disable=SC1091
+  . /etc/default/scrub-ghost
+fi
+
+: "${SCRUB_GHOST_BIN:=/usr/local/bin/scrub-ghost}"
+
+if declare -p SCRUB_GHOST_ARGS >/dev/null 2>&1; then
+  :
+else
+  SCRUB_GHOST_ARGS=(--force --prune-stale-snapshots --keep-backups 5 --no-color)
+fi
+
+exec "$SCRUB_GHOST_BIN" "${SCRUB_GHOST_ARGS[@]}"
+EOF
+
+  chmod 0755 -- "$wrapper"
+
+  cat >/etc/systemd/system/scrub-ghost.service <<'EOF'
+[Unit]
+Description=Clean up ghost BLS entries (scrub-ghost)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/scrub-ghost/run-systemd
+StandardOutput=journal
+StandardError=journal
+EOF
+
+  cat >/etc/systemd/system/scrub-ghost.timer <<'EOF'
+[Unit]
+Description=Run scrub-ghost weekly
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  if [[ ! -f /etc/default/scrub-ghost && ! -f /etc/sysconfig/scrub-ghost ]]; then
+    local bin
+    bin="$(command -v scrub-ghost 2>/dev/null || true)"
+    [[ -z "$bin" ]] && bin="/usr/local/bin/scrub-ghost"
+
+    cat >/etc/default/scrub-ghost <<EOF
+# scrub-ghost systemd configuration
+# You may also use: /etc/sysconfig/scrub-ghost
+
+SCRUB_GHOST_BIN="$bin"
+SCRUB_GHOST_ARGS=(
+  --force
+  --prune-stale-snapshots
+  --keep-backups 5
+  --no-color
+)
+EOF
+    chmod 0644 -- /etc/default/scrub-ghost
+    log "Installed default config: /etc/default/scrub-ghost"
+  else
+    log "Config already exists; leaving it unchanged."
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+  fi
+}
+
+systemd_remove_builtin() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now scrub-ghost.timer 2>/dev/null || true
+  fi
+  rm -f -- /etc/systemd/system/scrub-ghost.service /etc/systemd/system/scrub-ghost.timer 2>/dev/null || true
+  rm -rf -- /usr/local/libexec/scrub-ghost 2>/dev/null || true
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload 2>/dev/null || true
+  fi
+}
+
+zypp_install_builtin() {
+  install -d -m 0755 -- /etc/zypp/commit.d
+  cat >/etc/zypp/commit.d/50-scrub-ghost <<'EOF'
+#!/bin/sh
+# Run scrub-ghost after zypper operations
+# NOTE: Keep this fast; this runs after every zypp commit.
+
+BIN="/usr/local/bin/scrub-ghost"
+LOG="/var/log/scrub-ghost-zypp.log"
+
+if [ -x "$BIN" ]; then
+  "$BIN" --force --prune-stale-snapshots --no-color >>"$LOG" 2>&1 || true
+fi
+EOF
+  chmod 0755 -- /etc/zypp/commit.d/50-scrub-ghost
+}
+
+zypp_remove_builtin() {
+  rm -f -- /etc/zypp/commit.d/50-scrub-ghost 2>/dev/null || true
+}
+
+systemd_install_or_update() {
+  local src
+  src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+  local inst
+  inst="$(dirname -- "$src")/systemd/install-systemd.sh"
+
+  if [[ -x "$inst" ]]; then
+    "$inst"
+  else
+    warn "Systemd installer script not found (standalone mode). Using built-in installer."
+    systemd_install_builtin
+  fi
+}
+
+systemd_remove() {
+  local src
+  src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+  local inst
+  inst="$(dirname -- "$src")/systemd/install-systemd.sh"
+
+  if [[ -x "$inst" ]]; then
+    "$inst" --uninstall
+  else
+    warn "Systemd installer script not found (standalone mode). Removing known paths."
+    systemd_remove_builtin
+  fi
+}
+
+zypp_install_or_update() {
+  local src
+  src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+  local inst
+  inst="$(dirname -- "$src")/zypp/install-zypp-hook.sh"
+
+  if [[ -x "$inst" ]]; then
+    "$inst"
+  else
+    warn "Zypp installer script not found (standalone mode). Using built-in installer."
+    zypp_install_builtin
+  fi
+}
+
+zypp_remove() {
+  local src
+  src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+  local inst
+  inst="$(dirname -- "$src")/zypp/install-zypp-hook.sh"
+
+  if [[ -x "$inst" ]]; then
+    "$inst" --uninstall
+  else
+    zypp_remove_builtin
+  fi
+}
+
 menu_install() {
   while true; do
     menu_header
@@ -1116,16 +1289,12 @@ menu_install() {
 
         # If integrations are already present, refresh them (update in place)
         if [[ -f /etc/systemd/system/scrub-ghost.service || -d /usr/local/libexec/scrub-ghost ]]; then
-          if [[ -x "$(dirname -- "$src")/systemd/install-systemd.sh" ]]; then
-            "$(dirname -- "$src")/systemd/install-systemd.sh" || true
-            log "Updated existing systemd integration."
-          fi
+          systemd_install_or_update || true
+          log "Updated existing systemd integration."
         fi
         if [[ -f /etc/zypp/commit.d/50-scrub-ghost ]]; then
-          if [[ -x "$(dirname -- "$src")/zypp/install-zypp-hook.sh" ]]; then
-            "$(dirname -- "$src")/zypp/install-zypp-hook.sh" || true
-            log "Updated existing zypp hook."
-          fi
+          zypp_install_or_update || true
+          log "Updated existing zypp hook."
         fi
 
         log "Try: sudo scrub-ghost --help"
@@ -1149,59 +1318,23 @@ menu_install() {
         prompt_enter_to_continue
         ;;
       3)
-        local src
-        src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
-        local inst
-        inst="$(dirname -- "$src")/systemd/install-systemd.sh"
-        if [[ -x "$inst" ]]; then
-          "$inst"
-          log "Installed/updated systemd integration."
-        else
-          err "Systemd installer not found/executable: $inst"
-        fi
+        systemd_install_or_update
+        log "Installed/updated systemd integration."
         prompt_enter_to_continue
         ;;
       4)
-        local src
-        src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
-        local inst
-        inst="$(dirname -- "$src")/systemd/install-systemd.sh"
-        if [[ -x "$inst" ]]; then
-          "$inst" --uninstall
-          log "Removed systemd integration."
-        else
-          warn "Systemd installer not found; removing known unit paths directly"
-          rm -f -- /etc/systemd/system/scrub-ghost.service /etc/systemd/system/scrub-ghost.timer 2>/dev/null || true
-          rm -rf -- /usr/local/libexec/scrub-ghost 2>/dev/null || true
-          systemctl daemon-reload 2>/dev/null || true
-        fi
+        systemd_remove
+        log "Removed systemd integration."
         prompt_enter_to_continue
         ;;
       5)
-        local src
-        src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
-        local inst
-        inst="$(dirname -- "$src")/zypp/install-zypp-hook.sh"
-        if [[ -x "$inst" ]]; then
-          "$inst"
-          log "Installed/updated zypp hook."
-        else
-          err "Zypp installer not found/executable: $inst"
-        fi
+        zypp_install_or_update
+        log "Installed/updated zypp hook."
         prompt_enter_to_continue
         ;;
       6)
-        local src
-        src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
-        local inst
-        inst="$(dirname -- "$src")/zypp/install-zypp-hook.sh"
-        if [[ -x "$inst" ]]; then
-          "$inst" --uninstall
-          log "Removed zypp hook."
-        else
-          rm -f -- /etc/zypp/commit.d/50-scrub-ghost 2>/dev/null || true
-          log "Removed: /etc/zypp/commit.d/50-scrub-ghost"
-        fi
+        zypp_remove
+        log "Removed zypp hook."
         prompt_enter_to_continue
         ;;
       7)
