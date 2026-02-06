@@ -170,6 +170,21 @@ If your boot menu is missing entries:
 If no backup validates but you still want to restore anyway (dangerous):
 - `sudo scrub-ghost --restore-latest --restore-anyway --rebuild-grub`
 
+## Live ISO rescue / chroot mode
+If your installed system won’t boot normally, you can run the tool from a Live ISO and chroot into the installed system.
+
+Start the wizard:
+- `sudo ./scrub.sh --rescue`
+
+The wizard:
+- scans for btrfs partitions via `lsblk`
+- mounts the selected device at `/mnt/scrub-ghost-rescue` (default btrfs subvolume)
+- bind-mounts `/dev`, `/proc`, `/sys` (and best-effort `/run`)
+- runs `mount -a` inside the chroot (best effort) to mount `/boot`, `/boot/efi`, etc
+- injects and starts `scrub.sh --menu` inside the chroot
+
+Exit the menu to return to the Live ISO; the wizard will unmount everything best-effort.
+
 ## Install the command (optional)
 Install/upgrade the command to `/usr/local/bin/scrub-ghost`:
 - `sudo ./install.sh`
