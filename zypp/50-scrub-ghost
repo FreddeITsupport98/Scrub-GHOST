@@ -1,0 +1,10 @@
+#!/bin/sh
+# Run scrub-ghost after zypper operations
+# NOTE: Keep this fast; this runs after every zypp commit.
+
+BIN="/usr/local/bin/scrub-ghost"
+LOG="/var/log/scrub-ghost-zypp.log"
+
+if [ -x "$BIN" ]; then
+  "$BIN" --force --prune-stale-snapshots --no-color >>"$LOG" 2>&1 || true
+fi

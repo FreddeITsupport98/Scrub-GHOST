@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# Load config if present (openSUSE may prefer /etc/sysconfig)
+if [[ -f /etc/sysconfig/scrub-ghost ]]; then
+  # shellcheck disable=SC1091
+  . /etc/sysconfig/scrub-ghost
+elif [[ -f /etc/default/scrub-ghost ]]; then
+  # shellcheck disable=SC1091
+  . /etc/default/scrub-ghost
+fi
+
+: "${SCRUB_GHOST_BIN:=/usr/local/bin/scrub-ghost}"
+
+# Preferred: args as a bash array in config
+if declare -p SCRUB_GHOST_ARGS >/dev/null 2>&1; then
+  :
+else
+  # Fallback: a conservative default set
+  SCRUB_GHOST_ARGS=(--force --prune-stale-snapshots --keep-backups 5 --no-color)
+fi
+
+exec "$SCRUB_GHOST_BIN" "${SCRUB_GHOST_ARGS[@]}"

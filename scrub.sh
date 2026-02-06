@@ -1081,6 +1081,140 @@ menu_danger() {
   done
 }
 
+menu_install() {
+  while true; do
+    menu_header
+    log "Install / uninstall"
+    log "(Integrations are optional and installed independently.)"
+    log "1) Install/upgrade command to /usr/local/bin/scrub-ghost"
+    log "2) Uninstall command /usr/local/bin/scrub-ghost"
+    log ""
+    log "3) Install/update systemd unit+timer (optional)"
+    log "4) Remove systemd unit+timer (optional)"
+    log ""
+    log "5) Install/update zypp hook (optional)"
+    log "6) Remove zypp hook (optional)"
+    log ""
+    log "7) Back"
+
+    local choice
+    read -r -p "> " choice </dev/tty || return 0
+
+    case "$choice" in
+      1)
+        local src
+        src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+        local dest="/usr/local/bin/scrub-ghost"
+        if [[ ! -f "$src" ]]; then
+          err "Cannot locate script path for install: $src"
+          prompt_enter_to_continue
+          continue
+        fi
+        mkdir -p -- /usr/local/bin
+        install -m 0755 -- "$src" "$dest"
+        log "Installed: $dest"
+
+        # If integrations are already present, refresh them (update in place)
+        if [[ -f /etc/systemd/system/scrub-ghost.service || -d /usr/local/libexec/scrub-ghost ]]; then
+          if [[ -x "$(dirname -- "$src")/systemd/install-systemd.sh" ]]; then
+            "$(dirname -- "$src")/systemd/install-systemd.sh" || true
+            log "Updated existing systemd integration."
+          fi
+        fi
+        if [[ -f /etc/zypp/commit.d/50-scrub-ghost ]]; then
+          if [[ -x "$(dirname -- "$src")/zypp/install-zypp-hook.sh" ]]; then
+            "$(dirname -- "$src")/zypp/install-zypp-hook.sh" || true
+            log "Updated existing zypp hook."
+          fi
+        fi
+
+        log "Try: sudo scrub-ghost --help"
+        prompt_enter_to_continue
+        ;;
+      2)
+        local dest="/usr/local/bin/scrub-ghost"
+        if [[ -e "$dest" ]]; then
+          log "Type DELETE to uninstall $dest:"
+          local yn
+          read -r -p "> " yn </dev/tty || true
+          if [[ "$yn" == "DELETE" ]]; then
+            rm -f -- "$dest"
+            log "Removed: $dest"
+          else
+            log "Cancelled."
+          fi
+        else
+          log "Not installed: $dest"
+        fi
+        prompt_enter_to_continue
+        ;;
+      3)
+        local src
+        src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+        local inst
+        inst="$(dirname -- "$src")/systemd/install-systemd.sh"
+        if [[ -x "$inst" ]]; then
+          "$inst"
+          log "Installed/updated systemd integration."
+        else
+          err "Systemd installer not found/executable: $inst"
+        fi
+        prompt_enter_to_continue
+        ;;
+      4)
+        local src
+        src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+        local inst
+        inst="$(dirname -- "$src")/systemd/install-systemd.sh"
+        if [[ -x "$inst" ]]; then
+          "$inst" --uninstall
+          log "Removed systemd integration."
+        else
+          warn "Systemd installer not found; removing known unit paths directly"
+          rm -f -- /etc/systemd/system/scrub-ghost.service /etc/systemd/system/scrub-ghost.timer 2>/dev/null || true
+          rm -rf -- /usr/local/libexec/scrub-ghost 2>/dev/null || true
+          systemctl daemon-reload 2>/dev/null || true
+        fi
+        prompt_enter_to_continue
+        ;;
+      5)
+        local src
+        src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+        local inst
+        inst="$(dirname -- "$src")/zypp/install-zypp-hook.sh"
+        if [[ -x "$inst" ]]; then
+          "$inst"
+          log "Installed/updated zypp hook."
+        else
+          err "Zypp installer not found/executable: $inst"
+        fi
+        prompt_enter_to_continue
+        ;;
+      6)
+        local src
+        src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+        local inst
+        inst="$(dirname -- "$src")/zypp/install-zypp-hook.sh"
+        if [[ -x "$inst" ]]; then
+          "$inst" --uninstall
+          log "Removed zypp hook."
+        else
+          rm -f -- /etc/zypp/commit.d/50-scrub-ghost 2>/dev/null || true
+          log "Removed: /etc/zypp/commit.d/50-scrub-ghost"
+        fi
+        prompt_enter_to_continue
+        ;;
+      7)
+        return 0
+        ;;
+      *)
+        log "Invalid option."
+        prompt_enter_to_continue
+        ;;
+    esac
+  done
+}
+
 menu_main() {
   while true; do
     menu_header
@@ -1090,6 +1224,7 @@ menu_main() {
     log "4) Settings (submenu)"
     log "5) Paths / advanced (submenu)"
     log "6) Danger zone (submenu)"
+    log "7) Install / uninstall (command only)"
     log "0) Exit"
     log ""
 
@@ -1103,6 +1238,7 @@ menu_main() {
       4) menu_settings ;;
       5) menu_paths ;;
       6) menu_danger ;;
+      7) menu_install ;;
       0) return 0 ;;
       *) log "Invalid option."; prompt_enter_to_continue ;;
     esac
@@ -1537,7 +1673,15 @@ for entry in "$ENTRIES_DIR"/*.conf; do
       continue
     fi
 
-    log "${C_GREEN}[OK]${C_RESET}   $(basename -- "$entry")"
+    if [[ "$VERBOSE" == true && ( "$is_running_kernel" == true || "$is_latest_kernel" == true ) ]]; then
+      prot_reason=""
+      [[ "$is_running_kernel" == true ]] && prot_reason+="running "
+      [[ "$is_latest_kernel" == true ]] && prot_reason+="latest "
+      log "${C_BLUE}[PROTECTED]${C_RESET} $(basename -- "$entry") ${C_DIM}(${prot_reason}kernel: ${entry_kver:-unknown})${C_RESET}"
+      protected_kernel_count=$((protected_kernel_count + 1))
+    else
+      log "${C_GREEN}[OK]${C_RESET}   $(basename -- "$entry")"
+    fi
     ok_count=$((ok_count + 1))
     continue
   fi

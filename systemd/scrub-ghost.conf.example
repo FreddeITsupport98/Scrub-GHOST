@@ -1,0 +1,15 @@
+# scrub-ghost systemd configuration
+# Place this file as ONE of:
+#   /etc/default/scrub-ghost
+#   /etc/sysconfig/scrub-ghost
+
+# Path to the installed command
+SCRUB_GHOST_BIN="/usr/local/bin/scrub-ghost"
+
+# Args must be a bash array (safe, no eval)
+SCRUB_GHOST_ARGS=(
+  --force
+  --prune-stale-snapshots
+  --keep-backups 5
+  --no-color
+)

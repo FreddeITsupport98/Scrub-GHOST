@@ -1,0 +1,11 @@
+[Unit]
+Description=Clean up ghost BLS entries (scrub-ghost)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+# Wrapper reads /etc/default/scrub-ghost or /etc/sysconfig/scrub-ghost
+# and then executes SCRUB_GHOST_BIN with SCRUB_GHOST_ARGS array.
+ExecStart=/usr/local/libexec/scrub-ghost/run-systemd
+StandardOutput=journal
+StandardError=journal
