@@ -20,8 +20,11 @@ BOOT_DIR_SET=false
 DRY_RUN=true
 DELETE_MODE="backup" # "backup" or "delete"
 BACKUP_DIR=""        # if empty, a timestamped dir under BACKUP_ROOT will be used
+BACKUP_DIR_SET=false
+
 REBUILD_GRUB=false
 GRUB_CFG="/boot/grub2/grub.cfg"
+GRUB_CFG_SET=false
 
 # Backup root (never inside ENTRIES_DIR by default)
 BACKUP_ROOT="/var/backups/scrub-ghost"
@@ -675,6 +678,7 @@ while [[ $# -gt 0 ]]; do
     --backup-dir)
       shift
       BACKUP_DIR="${1:-}"
+      BACKUP_DIR_SET=true
       ;;
     --backup-root)
       shift
@@ -700,6 +704,7 @@ while [[ $# -gt 0 ]]; do
     --grub-cfg)
       shift
       GRUB_CFG="${1:-}"
+      GRUB_CFG_SET=true
       ;;
 
     --list-backups)
@@ -841,6 +846,16 @@ build_common_flags() {
     COMMON_FLAGS+=("--log-file" "$LOG_FILE")
   fi
 
+  # Restore behavior knobs
+  [[ "$RESTORE_ANYWAY" == true ]] && COMMON_FLAGS+=("--restore-anyway")
+  [[ "$CLEAN_RESTORE" == true ]] && COMMON_FLAGS+=("--clean-restore")
+
+  # Rebuild grub after apply operations (restore/clean)
+  [[ "$REBUILD_GRUB" == true ]] && COMMON_FLAGS+=("--rebuild-grub")
+  if [[ "$GRUB_CFG_SET" == true ]]; then
+    COMMON_FLAGS+=("--grub-cfg" "$GRUB_CFG")
+  fi
+
   [[ "$AUTO_BACKUP" == false ]] && COMMON_FLAGS+=("--no-backup")
   [[ "$AUTO_SNAPPER_BACKUP" == false ]] && COMMON_FLAGS+=("--no-snapper-backup")
 
@@ -850,6 +865,9 @@ build_common_flags() {
   # Keep using same backup root if user changed it
   [[ -n "$BACKUP_ROOT" ]] && COMMON_FLAGS+=("--backup-root" "$BACKUP_ROOT")
   [[ -n "$KEEP_BACKUPS" ]] && COMMON_FLAGS+=("--keep-backups" "$KEEP_BACKUPS")
+
+  # If user explicitly set backup dir, preserve it
+  [[ "$BACKUP_DIR_SET" == true ]] && COMMON_FLAGS+=("--backup-dir" "$BACKUP_DIR")
 
   # Preserve manual directory overrides if used
   [[ "$ENTRIES_DIR_SET" == true ]] && COMMON_FLAGS+=("--entries-dir" "$ENTRIES_DIR")
@@ -871,46 +889,41 @@ menu_header() {
   log ""
 }
 
-menu_main() {
+menu_clean() {
   while true; do
     menu_header
-    log "1) Scan (dry-run)"
-    log "2) Clean: prune stale Snapper entries (safe move + backups)"
-    log "3) Clean: remove ghosts only (safe move + backups)"
-    log "4) Clean: ghosts + stale Snapper entries (safe move + backups)"
-    log "5) Clean: prune uninstalled-kernel entries (requires confirm flag)"
-    log ""
-    log "6) Backups: list"
-    log "7) Backups: validate (submenu)"
-    log "8) Backups: restore (submenu)"
-    log ""
-    log "9) Settings (submenu)"
-    log "0) Exit"
-    log ""
+    log "Clean (safe mode: moves entries to backup; creates backups first)"
+    log "1) Prune stale Snapper entries"
+    log "2) Remove ghosts only"
+    log "3) Prune stale Snapper + uninstalled-kernel entries (requires YES)"
+    log "4) Prune uninstalled-kernel entries only (requires YES)"
+    log "5) Back"
 
     local choice
     read -r -p "> " choice </dev/tty || return 0
 
     case "$choice" in
       1)
-        run_sub --dry-run
+        run_sub --force --prune-stale-snapshots
         prompt_enter_to_continue
         ;;
       2)
-        run_sub --force --prune-stale-snapshots
-        prompt_enter_to_continue
-        ;;
-      3)
         run_sub --force
         prompt_enter_to_continue
         ;;
-      4)
-        run_sub --force --prune-stale-snapshots
+      3)
+        log "Type YES to proceed (stale snapshots + uninstalled kernels):"
+        local yn
+        read -r -p "> " yn </dev/tty || true
+        if [[ "$yn" == "YES" ]]; then
+          run_sub --force --prune-stale-snapshots --prune-uninstalled --confirm-uninstalled
+        else
+          log "Cancelled."
+        fi
         prompt_enter_to_continue
         ;;
-      5)
-        log "This will only prune uninstalled-kernel entries if you also pass --confirm-uninstalled."
-        log "Type YES to proceed with prune-uninstalled+confirm:"
+      4)
+        log "Type YES to proceed (uninstalled kernels):"
         local yn
         read -r -p "> " yn </dev/tty || true
         if [[ "$yn" == "YES" ]]; then
@@ -920,20 +933,7 @@ menu_main() {
         fi
         prompt_enter_to_continue
         ;;
-      6)
-        run_sub --list-backups
-        prompt_enter_to_continue
-        ;;
-      7)
-        menu_validate
-        ;;
-      8)
-        menu_restore
-        ;;
-      9)
-        menu_settings
-        ;;
-      0)
+      5)
         return 0
         ;;
       *)
@@ -944,13 +944,179 @@ menu_main() {
   done
 }
 
+menu_backups() {
+  while true; do
+    menu_header
+    log "Backups"
+    log "1) List backups"
+    log "2) Validate backups (submenu)"
+    log "3) Restore backups (submenu)"
+    log "4) Back"
+
+    local choice
+    read -r -p "> " choice </dev/tty || return 0
+
+    case "$choice" in
+      1) run_sub --list-backups; prompt_enter_to_continue ;;
+      2) menu_validate ;;
+      3) menu_restore ;;
+      4) return 0 ;;
+      *) log "Invalid option."; prompt_enter_to_continue ;;
+    esac
+  done
+}
+
+menu_paths() {
+  while true; do
+    menu_header
+    log "Paths / advanced"
+    log "(Tip: type 'auto' to reset to auto-detect)"
+    log "1) Set entries dir override (currently: ${ENTRIES_DIR_SET:+$ENTRIES_DIR})"
+    log "2) Set boot dir override    (currently: ${BOOT_DIR_SET:+$BOOT_DIR})"
+    log "3) Set backup root          (currently: $BACKUP_ROOT)"
+    log "4) Set backup dir override  (currently: ${BACKUP_DIR_SET:+$BACKUP_DIR})"
+    log "5) Set log file             (currently: $LOG_FILE)"
+    log "6) Toggle rebuild grub       (currently: $REBUILD_GRUB)"
+    log "7) Set grub cfg path         (currently: $GRUB_CFG)"
+    log "8) Back"
+
+    local choice
+    read -r -p "> " choice </dev/tty || return 0
+
+    case "$choice" in
+      1)
+        local v
+        read -r -p "Entries dir: " v </dev/tty || true
+        if [[ "$v" == "auto" ]]; then
+          ENTRIES_DIR_SET=false
+          ENTRIES_DIR=""
+        elif [[ -n "$v" ]]; then
+          ENTRIES_DIR_SET=true
+          ENTRIES_DIR="$v"
+        fi
+        ;;
+      2)
+        local v
+        read -r -p "Boot dir: " v </dev/tty || true
+        if [[ "$v" == "auto" ]]; then
+          BOOT_DIR_SET=false
+          BOOT_DIR=""
+        elif [[ -n "$v" ]]; then
+          BOOT_DIR_SET=true
+          BOOT_DIR="$v"
+        fi
+        ;;
+      3)
+        local v
+        read -r -p "Backup root: " v </dev/tty || true
+        [[ -n "$v" ]] && BACKUP_ROOT="$v"
+        ;;
+      4)
+        local v
+        read -r -p "Backup dir: " v </dev/tty || true
+        if [[ "$v" == "auto" ]]; then
+          BACKUP_DIR_SET=false
+          BACKUP_DIR=""
+        elif [[ -n "$v" ]]; then
+          BACKUP_DIR_SET=true
+          BACKUP_DIR="$v"
+        fi
+        ;;
+      5)
+        local v
+        read -r -p "Log file path: " v </dev/tty || true
+        [[ -n "$v" ]] && LOG_FILE="$v"
+        init_logging
+        ;;
+      6)
+        REBUILD_GRUB=$([[ "$REBUILD_GRUB" == true ]] && echo false || echo true)
+        ;;
+      7)
+        local v
+        read -r -p "GRUB cfg path: " v </dev/tty || true
+        if [[ -n "$v" ]]; then
+          GRUB_CFG="$v"
+          GRUB_CFG_SET=true
+        fi
+        ;;
+      8) return 0 ;;
+      *) log "Invalid option." ;;
+    esac
+
+    prompt_enter_to_continue
+  done
+}
+
+menu_danger() {
+  while true; do
+    menu_header
+    log "${C_RED}DANGER ZONE${C_RESET} (permanent deletes)"
+    log "1) DELETE ghosts only"
+    log "2) DELETE stale Snapper entries"
+    log "3) DELETE uninstalled-kernel entries"
+    log "4) Back"
+
+    local choice
+    read -r -p "> " choice </dev/tty || return 0
+
+    case "$choice" in
+      1)
+        log "Type DELETE to confirm:"; local yn; read -r -p "> " yn </dev/tty || true
+        [[ "$yn" == "DELETE" ]] && run_sub --delete || log "Cancelled."
+        prompt_enter_to_continue
+        ;;
+      2)
+        log "Type DELETE to confirm:"; local yn; read -r -p "> " yn </dev/tty || true
+        [[ "$yn" == "DELETE" ]] && run_sub --delete --prune-stale-snapshots || log "Cancelled."
+        prompt_enter_to_continue
+        ;;
+      3)
+        log "Type DELETE to confirm:"; local yn; read -r -p "> " yn </dev/tty || true
+        [[ "$yn" == "DELETE" ]] && run_sub --delete --prune-uninstalled --confirm-uninstalled || log "Cancelled."
+        prompt_enter_to_continue
+        ;;
+      4) return 0 ;;
+      *) log "Invalid option."; prompt_enter_to_continue ;;
+    esac
+  done
+}
+
+menu_main() {
+  while true; do
+    menu_header
+    log "1) Scan (dry-run)"
+    log "2) Clean (submenu)"
+    log "3) Backups / Restore (submenu)"
+    log "4) Settings (submenu)"
+    log "5) Paths / advanced (submenu)"
+    log "6) Danger zone (submenu)"
+    log "0) Exit"
+    log ""
+
+    local choice
+    read -r -p "> " choice </dev/tty || return 0
+
+    case "$choice" in
+      1) run_sub --dry-run; prompt_enter_to_continue ;;
+      2) menu_clean ;;
+      3) menu_backups ;;
+      4) menu_settings ;;
+      5) menu_paths ;;
+      6) menu_danger ;;
+      0) return 0 ;;
+      *) log "Invalid option."; prompt_enter_to_continue ;;
+    esac
+  done
+}
+
 menu_validate() {
   while true; do
     menu_header
     log "Validate backups"
     log "1) Validate latest"
     log "2) Validate pick number"
-    log "3) Back"
+    log "3) Validate from path"
+    log "4) Back"
 
     local choice
     read -r -p "> " choice </dev/tty || return 0
@@ -967,6 +1133,12 @@ menu_validate() {
         prompt_enter_to_continue
         ;;
       3)
+        local p
+        read -r -p "Backup dir path: " p </dev/tty || true
+        run_sub --validate-from "$p"
+        prompt_enter_to_continue
+        ;;
+      4)
         return 0
         ;;
       *)
@@ -981,10 +1153,14 @@ menu_restore() {
   while true; do
     menu_header
     log "Restore backups (validated)"
+    log "Restore options: clean_restore=$CLEAN_RESTORE restore_anyway=$RESTORE_ANYWAY"
     log "1) Restore latest"
     log "2) Restore best (newest passing validation)"
     log "3) Restore pick number"
-    log "4) Back"
+    log "4) Restore from path"
+    log "5) Toggle clean restore (delete extras)"
+    log "6) Toggle restore anyway (dangerous)"
+    log "7) Back"
 
     local choice
     read -r -p "> " choice </dev/tty || return 0
@@ -1006,6 +1182,23 @@ menu_restore() {
         prompt_enter_to_continue
         ;;
       4)
+        local p
+        read -r -p "Backup dir path: " p </dev/tty || true
+        run_sub --restore-from "$p"
+        prompt_enter_to_continue
+        ;;
+      5)
+        CLEAN_RESTORE=$([[ "$CLEAN_RESTORE" == true ]] && echo false || echo true)
+        ;;
+      6)
+        if [[ "$RESTORE_ANYWAY" == false ]]; then
+          log "Type YES to enable restore-anyway:"; local yn; read -r -p "> " yn </dev/tty || true
+          [[ "$yn" == "YES" ]] && RESTORE_ANYWAY=true
+        else
+          RESTORE_ANYWAY=false
+        fi
+        ;;
+      7)
         return 0
         ;;
       *)
