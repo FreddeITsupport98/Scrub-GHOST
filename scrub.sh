@@ -19,9 +19,16 @@ BOOT_DIR_SET=false
 
 DRY_RUN=true
 DELETE_MODE="backup" # "backup" or "delete"
-BACKUP_DIR=""        # if empty, a timestamped dir under ENTRIES_DIR will be used
+BACKUP_DIR=""        # if empty, a timestamped dir under BACKUP_ROOT will be used
 REBUILD_GRUB=false
 GRUB_CFG="/boot/grub2/grub.cfg"
+
+# Backup root (never inside ENTRIES_DIR by default)
+BACKUP_ROOT="/var/backups/scrub-ghost"
+
+# Mode
+ACTION="scan"  # scan | list-backups | restore
+RESTORE_FROM=""
 
 # Verification / pruning knobs
 VERIFY_SNAPSHOTS=true
@@ -50,13 +57,19 @@ Default is DRY-RUN (no changes).
 
 Options:
   --dry-run              Scan only (default)
-  --force                Apply changes (moves ghost entries to backup dir)
+  --force                Apply changes (moves ghost/stale entries to backup dir)
   --delete               Permanently delete ghost entries (implies --force)
-  --backup-dir DIR       Where to move ghost entries when using --force
+  --backup-dir DIR       Backup directory to move pruned entries into (default: auto)
+  --backup-root DIR      Root directory used for automatic backups (default: /var/backups/scrub-ghost)
   --entries-dir DIR      BLS entries directory (default: auto-detect)
   --boot-dir DIR         Root dir used to resolve BLS paths (default: derived from entries dir)
   --rebuild-grub         Run grub2-mkconfig after changes
   --grub-cfg PATH        Output path for grub2-mkconfig (default: /boot/grub2/grub.cfg)
+
+Easy restore:
+  --list-backups         List backup folders under backup root
+  --restore-latest       Restore BLS entries from the latest backup (replaces current *.conf)
+  --restore-from DIR     Restore BLS entries from a specific backup directory
 
 Backup (runs automatically on --force/--delete):
   --no-backup             Do not create a filesystem backup copy of entries before changes
@@ -73,9 +86,10 @@ Verification / pruning (all safe by default; pruning requires --force):
 
 Examples:
   sudo ./scrub.sh
-  sudo ./scrub.sh --force
-  sudo ./scrub.sh --force --backup-dir /root/bls-backup
-  sudo ./scrub.sh --delete
+  sudo ./scrub.sh --force --prune-stale-snapshots
+  sudo ./scrub.sh --list-backups
+  sudo ./scrub.sh --restore-latest
+  sudo ./scrub.sh --restore-from /var/backups/scrub-ghost/bls-entries-YYYYMMDD-HHMMSS
 USAGE
 }
 
@@ -84,6 +98,71 @@ warn() { printf 'WARN: %s\n' "$*"; }
 err() { printf 'ERROR: %s\n' "$*" >&2; }
 
 ts_now() { date +%Y%m%d-%H%M%S; }
+
+latest_backup_dir() {
+  # Prefer explicit latest symlink; otherwise pick newest matching directory.
+  if [[ -d "$BACKUP_ROOT/latest" ]]; then
+    printf '%s\n' "$BACKUP_ROOT/latest"
+    return 0
+  fi
+
+  ls -1dt "$BACKUP_ROOT"/bls-entries-* 2>/dev/null | head -n 1 || true
+}
+
+list_backups() {
+  mkdir -p -- "$BACKUP_ROOT" 2>/dev/null || true
+  if ! ls -1d "$BACKUP_ROOT"/bls-entries-* >/dev/null 2>&1; then
+    log "No backups found under: $BACKUP_ROOT"
+    exit 0
+  fi
+
+  log "Backups under: $BACKUP_ROOT"
+  ls -1dt "$BACKUP_ROOT"/bls-entries-* 2>/dev/null | while IFS= read -r d; do
+    local when
+    when="$(basename -- "$d")"
+    local count
+    count="$(ls -1 "$d"/full/*.conf 2>/dev/null | wc -l || true)"
+    if [[ -f "$d/manifest.txt" ]]; then
+      log "- $d (full entries: $count)"
+    else
+      log "- $d (full entries: $count; no manifest)"
+    fi
+  done
+}
+
+restore_entries_from_backup() {
+  local src="$1"
+  if [[ -z "$src" ]]; then
+    err "restore: missing source directory"
+    exit 2
+  fi
+  if [[ ! -d "$src" ]]; then
+    err "restore: backup dir not found: $src"
+    exit 1
+  fi
+  if ! compgen -G "$src/full/*.conf" >/dev/null; then
+    err "restore: no 'full/*.conf' found in: $src"
+    exit 1
+  fi
+
+  # Backup current entries before replacing.
+  local ts
+  ts="$(ts_now)"
+  local pre_dir="$BACKUP_ROOT/restore-pre-$ts"
+  mkdir -p -- "$pre_dir"
+
+  if compgen -G "$ENTRIES_DIR/*.conf" >/dev/null; then
+    cp -a -- "$ENTRIES_DIR"/*.conf "$pre_dir/" 2>/dev/null || cp -p -- "$ENTRIES_DIR"/*.conf "$pre_dir/"
+  fi
+
+  # Replace entries set (clear then copy).
+  rm -f -- "$ENTRIES_DIR"/*.conf 2>/dev/null || true
+  cp -a -- "$src"/full/*.conf "$ENTRIES_DIR/" 2>/dev/null || cp -p -- "$src"/full/*.conf "$ENTRIES_DIR/"
+
+  log "Restore complete."
+  log "- Restored from: $src"
+  log "- Previous entries saved to: $pre_dir"
+}
 
 resolve_boot_path() {
   # Resolves a BLS path to a concrete path on disk.
@@ -196,6 +275,10 @@ while [[ $# -gt 0 ]]; do
       shift
       BACKUP_DIR="${1:-}"
       ;;
+    --backup-root)
+      shift
+      BACKUP_ROOT="${1:-}"
+      ;;
     --entries-dir)
       shift
       ENTRIES_DIR="${1:-}"
@@ -212,6 +295,19 @@ while [[ $# -gt 0 ]]; do
     --grub-cfg)
       shift
       GRUB_CFG="${1:-}"
+      ;;
+
+    --list-backups)
+      ACTION="list-backups"
+      ;;
+    --restore-latest)
+      ACTION="restore"
+      RESTORE_FROM="__LATEST__"
+      ;;
+    --restore-from)
+      ACTION="restore"
+      shift
+      RESTORE_FROM="${1:-}"
       ;;
 
     --no-backup)
@@ -265,6 +361,28 @@ if [[ -z "$ENTRIES_DIR" || ! -d "$ENTRIES_DIR" ]]; then
   exit 1
 fi
 
+# Handle non-scan actions early (after we know ENTRIES_DIR).
+if [[ "$ACTION" == "list-backups" ]]; then
+  list_backups
+  exit 0
+fi
+
+if [[ "$ACTION" == "restore" ]]; then
+  mkdir -p -- "$BACKUP_ROOT" 2>/dev/null || true
+
+  if [[ "$RESTORE_FROM" == "__LATEST__" ]]; then
+    RESTORE_FROM="$(latest_backup_dir)"
+  fi
+
+  if [[ -z "$RESTORE_FROM" ]]; then
+    err "restore: no backup found (use --list-backups)"
+    exit 1
+  fi
+
+  restore_entries_from_backup "$RESTORE_FROM"
+  exit 0
+fi
+
 if [[ "$BOOT_DIR_SET" == false ]]; then
   BOOT_DIR="$(dirname "$(dirname "$ENTRIES_DIR")")"
 fi
@@ -305,14 +423,19 @@ ensure_backup_dir() {
 
     # Prefer a backup path OUTSIDE the entries dir so we never touch it by accident.
     # Fall back to inside ENTRIES_DIR if /var/backups isn't writable for some reason.
-    if mkdir -p -- "/var/backups/scrub-ghost" 2>/dev/null; then
-      BACKUP_DIR="/var/backups/scrub-ghost/bls-entries-$ts"
+    if mkdir -p -- "$BACKUP_ROOT" 2>/dev/null; then
+      BACKUP_DIR="$BACKUP_ROOT/bls-entries-$ts"
     else
       BACKUP_DIR="$ENTRIES_DIR/.scrub-ghost-backup-$ts"
     fi
   fi
 
   mkdir -p -- "$BACKUP_DIR"
+
+  # Point latest -> this backup dir (best effort)
+  if [[ "$BACKUP_DIR" == "$BACKUP_ROOT"/* ]]; then
+    ln -sfn -- "$BACKUP_DIR" "$BACKUP_ROOT/latest" 2>/dev/null || true
+  fi
 }
 
 backup_entries_tree() {
@@ -334,6 +457,9 @@ backup_entries_tree() {
     echo "entries_dir=$ENTRIES_DIR"
     echo "boot_dir=$BOOT_DIR"
     echo "delete_mode=$DELETE_MODE"
+    if [[ -n "$SNAPPER_BACKUP_ID" ]]; then
+      echo "snapper_backup_id=$SNAPPER_BACKUP_ID"
+    fi
   } >"$BACKUP_DIR/manifest.txt" || true
 }
 
