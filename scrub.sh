@@ -35,12 +35,16 @@ BACKUP_ROOT="/var/backups/scrub-ghost"
 KEEP_BACKUPS=5
 
 # Mode
-ACTION="scan"  # scan | list-backups | restore | validate
+ACTION="scan"  # scan | list-backups | restore | validate | rescue
 RESTORE_FROM=""
 RESTORE_PICK=""        # 1 = newest, 2 = second newest, etc.
 RESTORE_ANYWAY=false
 RESTORE_BEST=false
 CLEAN_RESTORE=false
+
+# Rescue / chroot mode (Live ISO helper)
+RESCUE_MOUNT_POINT="/mnt/scrub-ghost-rescue"
+RESCUE_SHIM_PATH="/tmp/scrub-rescue-shim.sh"
 
 # Safety guardrails
 RUNNING_KERNEL_VER=""
@@ -115,6 +119,7 @@ Options:
 
 Interactive:
   --menu                 Start interactive menu
+  --rescue               Run the rescue/chroot wizard (intended for Live ISO environments)
 
 Easy restore:
   --list-backups         List backup folders under backup root (numbered)
@@ -182,6 +187,7 @@ _arguments -s \
   '--debug[debug logging]' \
   '--log-file=[log file path]:file:_files' \
   '--menu[start interactive menu]' \
+  '--rescue[run rescue/chroot wizard (live ISO)]' \
   '--list-backups[list backups]' \
   '--restore-latest[restore from latest backup]' \
   '--restore-best[restore from best backup]' \
@@ -209,7 +215,7 @@ EOF
 _scrub_ghost_complete() {
   local cur
   cur="${COMP_WORDS[COMP_CWORD]}"
-  local opts="--dry-run --force --delete --backup-dir --backup-root --keep-backups --entries-dir --boot-dir --rebuild-grub --grub-cfg --update-sdboot --no-remount-rw --json --no-color --verbose --debug --log-file --menu --list-backups --restore-latest --restore-best --restore-pick --restore-from --clean-restore --restore-anyway --validate-latest --validate-pick --validate-from --no-backup --no-snapper-backup --no-verify-snapshots --no-verify-modules --prune-stale-snapshots --prune-uninstalled --prune-duplicates --confirm-uninstalled --completion --help"
+  local opts="--dry-run --force --delete --backup-dir --backup-root --keep-backups --entries-dir --boot-dir --rebuild-grub --grub-cfg --update-sdboot --no-remount-rw --json --no-color --verbose --debug --log-file --menu --rescue --list-backups --restore-latest --restore-best --restore-pick --restore-from --clean-restore --restore-anyway --validate-latest --validate-pick --validate-from --no-backup --no-snapper-backup --no-verify-snapshots --no-verify-modules --prune-stale-snapshots --prune-uninstalled --prune-duplicates --confirm-uninstalled --completion --help"
   COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
 }
 
@@ -962,6 +968,187 @@ preflight_backup_space_or_die() {
   fi
 }
 
+append_trap() {
+  # Append a handler to an existing trap (best effort).
+  # $1 = handler, $2 = signal
+  local handler="$1"
+  local sig="$2"
+
+  local existing
+  existing="$(trap -p "$sig" 2>/dev/null | awk -F"'" '{print $2}' || true)"
+
+  if [[ -n "$existing" ]]; then
+    trap "$existing; $handler" "$sig"
+  else
+    trap "$handler" "$sig"
+  fi
+}
+
+scan_btrfs_partitions() {
+  # Prints lines: "<dev> <fstype> <size> <uuid> <mountpoint>"
+  # Example: /dev/nvme0n1p2 btrfs 100G 0123-... /mnt
+  if ! command -v lsblk >/dev/null 2>&1; then
+    return 1
+  fi
+
+  lsblk -pnro NAME,FSTYPE,SIZE,UUID,MOUNTPOINT 2>/dev/null | awk '$2=="btrfs" {print}' || true
+}
+
+cleanup_rescue_mounts() {
+  # Idempotent best-effort cleanup.
+  ( set +e
+
+    [[ -n "${RESCUE_MOUNT_POINT:-}" ]] || return 0
+
+    if command -v mountpoint >/dev/null 2>&1; then
+      mountpoint -q -- "$RESCUE_MOUNT_POINT" || return 0
+    fi
+
+    # Try recursive unmount first.
+    umount -R -- "$RESCUE_MOUNT_POINT" 2>/dev/null || umount --recursive -- "$RESCUE_MOUNT_POINT" 2>/dev/null || true
+
+    # Fallback: unmount common bind mounts in reverse-ish order.
+    for mp in \
+      "$RESCUE_MOUNT_POINT/dev/pts" \
+      "$RESCUE_MOUNT_POINT/dev" \
+      "$RESCUE_MOUNT_POINT/proc" \
+      "$RESCUE_MOUNT_POINT/sys" \
+      "$RESCUE_MOUNT_POINT/run"; do
+      umount -l -- "$mp" 2>/dev/null || true
+    done
+
+    umount -l -- "$RESCUE_MOUNT_POINT" 2>/dev/null || true
+  )
+}
+
+setup_rescue_bind_mounts() {
+  local root="$1"
+
+  mkdir -p -- "$root/dev" "$root/proc" "$root/sys" "$root/dev/pts" "$root/run"
+
+  mount --rbind /dev "$root/dev"
+  mount --rbind /proc "$root/proc"
+  mount --rbind /sys "$root/sys"
+
+  # /run is important for some tools; best effort.
+  mount --rbind /run "$root/run" 2>/dev/null || true
+
+  if command -v mount >/dev/null 2>&1; then
+    mount --make-rslave "$root/dev" 2>/dev/null || true
+    mount --make-rslave "$root/proc" 2>/dev/null || true
+    mount --make-rslave "$root/sys" 2>/dev/null || true
+    mount --make-rslave "$root/run" 2>/dev/null || true
+  fi
+}
+
+inject_self_into_chroot() {
+  local root="$1"
+  local dest="$root$RESCUE_SHIM_PATH"
+
+  mkdir -p -- "$(dirname -- "$dest")"
+
+  # Copy script contents rather than relying on cp from potentially odd mount sources.
+  if ! cat -- "$0" >"$dest" 2>/dev/null; then
+    cp -- "$0" "$dest"
+  fi
+  chmod 0755 -- "$dest"
+}
+
+perform_rescue_chroot() {
+  local dev="$1"
+
+  if [[ -z "$dev" ]]; then
+    err "rescue: no device selected"
+    return 1
+  fi
+  if [[ ! -b "$dev" ]]; then
+    err "rescue: not a block device: $dev"
+    return 1
+  fi
+
+  mkdir -p -- "$RESCUE_MOUNT_POINT"
+
+  log "Mounting target root (btrfs default subvolume): $dev -> $RESCUE_MOUNT_POINT"
+  mount -- "$dev" "$RESCUE_MOUNT_POINT"
+
+  append_trap cleanup_rescue_mounts EXIT
+  append_trap cleanup_rescue_mounts INT
+  append_trap cleanup_rescue_mounts TERM
+
+  setup_rescue_bind_mounts "$RESCUE_MOUNT_POINT"
+  inject_self_into_chroot "$RESCUE_MOUNT_POINT"
+
+  log "Entering chroot. Inside chroot we'll run: mount -a (best effort), then start scrub-ghost menu."
+  log "Exit the menu to return here and unmount everything."
+
+  chroot "$RESCUE_MOUNT_POINT" /bin/bash -c "mount -a 2>/dev/null || true; exec $RESCUE_SHIM_PATH --menu" </dev/tty
+
+  cleanup_rescue_mounts
+}
+
+menu_rescue_wizard() {
+  log ""
+  log "${C_BOLD}Rescue / chroot wizard${C_RESET}"
+  log "This is intended for running from a Live ISO to chroot into an installed system."
+  log ""
+
+  local -a lines
+  mapfile -t lines < <(scan_btrfs_partitions || true)
+
+  if (( ${#lines[@]} == 0 )); then
+    warn "No btrfs partitions found via lsblk."
+    warn "If your root is encrypted, unlock it first (e.g., cryptsetup open), then re-run." 
+    return 1
+  fi
+
+  log "Detected btrfs partitions:"
+  local idx=1
+  local line
+  for line in "${lines[@]}"; do
+    local dev="" fstype="" size="" uuid="" mnt=""
+    IFS=' ' read -r dev fstype size uuid mnt <<<"$line"
+    [[ -z "$mnt" ]] && mnt="-"
+    log "  $idx) $dev  size=$size  uuid=$uuid  mounted=$mnt"
+    idx=$((idx + 1))
+  done
+
+  log ""
+  log "Pick a number to mount+chroot, or type a device path (e.g. /dev/nvme0n1p2), or 'q' to cancel."
+
+  local choice
+  read -r -p "> " choice </dev/tty || return 1
+
+  if [[ "$choice" == "q" || "$choice" == "quit" ]]; then
+    log "Cancelled."
+    return 0
+  fi
+
+  local dev=""
+  if [[ "$choice" =~ ^[0-9]+$ ]]; then
+    local n="$choice"
+    if (( n < 1 || n > ${#lines[@]} )); then
+      err "Invalid selection: $n"
+      return 1
+    fi
+    line="${lines[$((n-1))]}"
+    IFS=' ' read -r dev _rest <<<"$line"
+  else
+    dev="$choice"
+  fi
+
+  log ""
+  log "About to chroot into: $dev"
+  log "Type YES to continue:"
+  local yn
+  read -r -p "> " yn </dev/tty || true
+  if [[ "$yn" != "YES" ]]; then
+    log "Cancelled."
+    return 0
+  fi
+
+  perform_rescue_chroot "$dev"
+}
+
 main() {
   set -euo pipefail
   IFS=$'\n\t'
@@ -999,6 +1186,9 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --menu)
       MENU_REQUESTED=true
+      ;;
+    --rescue)
+      ACTION="rescue"
       ;;
     --no-menu)
       NO_MENU=true
@@ -1154,7 +1344,21 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
   shift
+
 done
+
+# Initialize colors/logging once we parsed flags.
+# (Rescue mode needs this before checking for BLS entries.)
+init_colors
+init_logging
+if [[ -n "$LOG_FILE" ]]; then
+  debug "Logging to: $LOG_FILE"
+fi
+
+if [[ "$ACTION" == "rescue" ]]; then
+  menu_rescue_wizard
+  return $?
+fi
 
 if [[ "$ENTRIES_DIR_SET" == false ]]; then
   # openSUSE commonly mounts the ESP at /boot/efi (sd-boot) and Fedora-like setups use /boot.
@@ -1191,12 +1395,6 @@ if [[ "$JSON_OUTPUT" == true ]]; then
   fi
 fi
 
-# Initialize colors/logging once we parsed flags.
-init_colors
-init_logging
-if [[ -n "$LOG_FILE" ]]; then
-  debug "Logging to: $LOG_FILE"
-fi
 
 # Validate keep-backups value
 if ! [[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]]; then
@@ -1758,6 +1956,7 @@ menu_main() {
     log "6) Danger zone (submenu)"
     log "7) Install / uninstall (command only)"
     log "8) Completion (submenu)"
+    log "9) Rescue / chroot wizard (Live ISO)"
     log "0) Exit"
     log ""
 
@@ -1773,6 +1972,7 @@ menu_main() {
       6) menu_danger ;;
       7) menu_install ;;
       8) menu_completion ;;
+      9) menu_rescue_wizard ; prompt_enter_to_continue ;;
       0) return 0 ;;
       *) log "Invalid option."; prompt_enter_to_continue ;;
     esac
