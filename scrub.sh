@@ -1631,6 +1631,7 @@ menu_main() {
     log "5) Paths / advanced (submenu)"
     log "6) Danger zone (submenu)"
     log "7) Install / uninstall (command only)"
+    log "8) Completion (submenu)"
     log "0) Exit"
     log ""
 
@@ -1645,7 +1646,28 @@ menu_main() {
       5) menu_paths ;;
       6) menu_danger ;;
       7) menu_install ;;
+      8) menu_completion ;;
       0) return 0 ;;
+      *) log "Invalid option."; prompt_enter_to_continue ;;
+    esac
+  done
+}
+
+menu_completion() {
+  while true; do
+    menu_header
+    log "Completion scripts (printed to stdout)"
+    log "1) Print zsh completion"
+    log "2) Print bash completion"
+    log "3) Back"
+
+    local choice
+    read -r -p "> " choice </dev/tty || return 0
+
+    case "$choice" in
+      1) run_sub --completion zsh ; prompt_enter_to_continue ;;
+      2) run_sub --completion bash ; prompt_enter_to_continue ;;
+      3) return 0 ;;
       *) log "Invalid option."; prompt_enter_to_continue ;;
     esac
   done
