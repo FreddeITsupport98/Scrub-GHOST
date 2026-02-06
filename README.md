@@ -1,3 +1,5 @@
+![Scrub-GHOST](Icon/images.png)
+
 # Scrub-GHOST
 `scrub-ghost` is a safety-focused maintenance tool for Boot Loader Specification (BLS) entry cleanup on openSUSE (commonly `sd-boot` with entries under `/boot/efi/loader/entries`).
 
