@@ -23,8 +23,12 @@ BACKUP_DIR=""        # if empty, a timestamped dir under BACKUP_ROOT will be use
 BACKUP_DIR_SET=false
 
 REBUILD_GRUB=false
+UPDATE_SDBOOT=false
 GRUB_CFG="/boot/grub2/grub.cfg"
 GRUB_CFG_SET=false
+
+# Read-only FS guard (MicroOS/Aeon): attempt temporary remount rw when applying changes
+AUTO_REMOUNT_RW=true
 
 # Backup root (never inside ENTRIES_DIR by default)
 BACKUP_ROOT="/var/backups/scrub-ghost"
@@ -56,6 +60,10 @@ LOG_FILE_SET=false
 # Interactive menu
 MENU_REQUESTED=false
 NO_MENU=false
+
+# Completion output
+PRINT_COMPLETION=false
+COMPLETION_SHELL="zsh"
 
 # Verification / pruning knobs
 VERIFY_SNAPSHOTS=true
@@ -93,6 +101,9 @@ Options:
   --boot-dir DIR         Root dir used to resolve BLS paths (default: derived from entries dir)
   --rebuild-grub         Run grub2-mkconfig after changes
   --grub-cfg PATH        Output path for grub2-mkconfig (default: /boot/grub2/grub.cfg)
+  --update-sdboot        Run sdbootutil update-kernels after changes (optional)
+  --no-remount-rw        Do not attempt temporary remount rw when entries/backup live on a read-only FS
+  --completion [SHELL]   Print a shell completion script (SHELL: zsh|bash; default: zsh) and exit
   --no-color             Disable colored output
   --verbose              Print extra details (including validation failures in --list-backups)
   --debug                Enable debug logging
@@ -137,6 +148,72 @@ Examples:
   sudo ./scrub.sh --restore-best
   sudo ./scrub.sh --restore-from /var/backups/scrub-ghost/bls-entries-YYYYMMDD-HHMMSS
 USAGE
+}
+
+print_completion() {
+  local shell="${1:-zsh}"
+  case "$shell" in
+    zsh)
+      cat <<'EOF'
+#compdef scrub-ghost scrub.sh
+
+_arguments -s \
+  '--help[show help]' \
+  '--dry-run[scan only (default)]' \
+  '--force[apply changes (move to backup)]' \
+  '--delete[permanently delete (implies --force)]' \
+  '--backup-dir=[backup directory]:dir:_files -/' \
+  '--backup-root=[backup root directory]:dir:_files -/' \
+  '--keep-backups=[keep last N backups]' \
+  '--entries-dir=[BLS entries directory]:dir:_files -/' \
+  '--boot-dir=[boot root directory]:dir:_files -/' \
+  '--rebuild-grub[run grub2-mkconfig after changes]' \
+  '--grub-cfg=[grub2-mkconfig output path]:file:_files' \
+  '--update-sdboot[run sdbootutil update-kernels after changes]' \
+  '--no-remount-rw[do not attempt temporary remount rw]' \
+  '--no-color[disable colored output]' \
+  '--verbose[verbose output]' \
+  '--debug[debug logging]' \
+  '--log-file=[log file path]:file:_files' \
+  '--menu[start interactive menu]' \
+  '--list-backups[list backups]' \
+  '--restore-latest[restore from latest backup]' \
+  '--restore-best[restore from best backup]' \
+  '--restore-pick=[restore pick number]' \
+  '--restore-from=[restore from directory]:dir:_files -/' \
+  '--clean-restore[delete extra current entries on restore]' \
+  '--restore-anyway[restore even if validation fails]' \
+  '--validate-latest[validate latest backup]' \
+  '--validate-pick=[validate pick number]' \
+  '--validate-from=[validate from directory]:dir:_files -/' \
+  '--no-backup[disable filesystem entry backup]' \
+  '--no-snapper-backup[disable snapper backup]' \
+  '--no-verify-snapshots[disable snapper snapshot verification]' \
+  '--no-verify-modules[disable kernel modules verification]' \
+  '--prune-stale-snapshots[prune stale snapper entries (requires --force)]' \
+  '--prune-uninstalled[prune uninstalled-kernel entries (requires --confirm-uninstalled)]' \
+  '--confirm-uninstalled[extra confirmation for --prune-uninstalled]' \
+  '--completion=[print completion script]:shell:(zsh bash)'
+EOF
+      ;;
+    bash)
+      cat <<'EOF'
+# bash completion for scrub-ghost / scrub.sh
+_scrub_ghost_complete() {
+  local cur
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  local opts="--dry-run --force --delete --backup-dir --backup-root --keep-backups --entries-dir --boot-dir --rebuild-grub --grub-cfg --update-sdboot --no-remount-rw --no-color --verbose --debug --log-file --menu --list-backups --restore-latest --restore-best --restore-pick --restore-from --clean-restore --restore-anyway --validate-latest --validate-pick --validate-from --no-backup --no-snapper-backup --no-verify-snapshots --no-verify-modules --prune-stale-snapshots --prune-uninstalled --confirm-uninstalled --completion --help"
+  COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+}
+
+complete -F _scrub_ghost_complete scrub-ghost scrub.sh
+EOF
+      ;;
+    *)
+      printf 'ERROR: unknown shell for --completion: %s\n' "$shell" >&2
+      return 2
+      ;;
+  esac
 }
 
 C_RESET=""
@@ -228,15 +305,25 @@ bls_get_path() {
   # $1 = key regex, $2 = file
   local key_re="$1"
   local file="$2"
+
+  # Note: we only read the first value field (BLS paths normally contain no spaces).
+  # Strip simple quoting ("/path" or '/path').
   awk -v re="$key_re" '
     /^[[:space:]]*#/ {next}
     NF < 2 {next}
-    $1 ~ re {print $2; exit}
+    $1 ~ re {
+      v=$2
+      gsub(/^"|"$/, "", v)
+      gsub(/^\x27|\x27$/, "", v)
+      print v
+      exit
+    }
   ' "$file" 2>/dev/null || true
 }
 
 bls_linux_path() { bls_get_path '^linux(efi)?$' "$1"; }
 bls_initrd_path() { bls_get_path '^initrd$' "$1"; }
+bls_devicetree_path() { bls_get_path '^devicetree$' "$1"; }
 
 # Kernel guardrails
 compute_kernel_guardrails() {
@@ -423,6 +510,7 @@ validate_backup_bootability() {
 
   local missing_kernel=0
   local missing_initrd=0
+  local missing_dt=0
   local missing_snapshot=0
 
   for f in "$src"/full/*.conf; do
@@ -444,6 +532,16 @@ validate_backup_bootability() {
       fi
     fi
 
+    local dtp
+    dtp="$(bls_devicetree_path "$f")"
+    if [[ -n "$dtp" ]]; then
+      local dtfull
+      dtfull="$(resolve_boot_path "$dtp" || true)"
+      if [[ -z "$dtfull" || ! -e "$dtfull" ]]; then
+        missing_dt=$((missing_dt + 1))
+      fi
+    fi
+
     if [[ "$VERIFY_SNAPSHOTS" == true ]]; then
       local sn
       sn="$(snapshot_num_from_entry "$f")"
@@ -455,11 +553,11 @@ validate_backup_bootability() {
     fi
   done
 
-  if [[ "$missing_kernel" -ne 0 || "$missing_initrd" -ne 0 || "$missing_snapshot" -ne 0 ]]; then
+  if [[ "$missing_kernel" -ne 0 || "$missing_initrd" -ne 0 || "$missing_dt" -ne 0 || "$missing_snapshot" -ne 0 ]]; then
     if [[ "$quiet" == true ]]; then
       return 1
     fi
-    err "validate: failed: missing kernel=$missing_kernel initrd=$missing_initrd snapshots=$missing_snapshot"
+    err "validate: failed: missing kernel=$missing_kernel initrd=$missing_initrd devicetree=$missing_dt snapshots=$missing_snapshot"
     return 1
   fi
 
@@ -634,13 +732,164 @@ snapshot_exists() {
   return 1
 }
 
-# Root check
-if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-  err "Please run as root (sudo)."
-  exit 1
-fi
+# Read-only filesystem handling (MicroOS/Aeon)
+# We only ever attempt remount on non-root mountpoints.
+#
+# This is best-effort and only used when applying changes.
 
-ORIG_ARGC=$#
+declare -A REMOUNT_WAS_RO
+REMOUNTED_MOUNTPOINTS=()
+
+mount_info_for_path() {
+  # Prints: "<mountpoint> <options>" or nothing.
+  local p="$1"
+
+  if command -v findmnt >/dev/null 2>&1; then
+    local mp opts
+    mp="$(findmnt -no TARGET -T "$p" 2>/dev/null | head -n 1 || true)"
+    opts="$(findmnt -no OPTIONS -T "$p" 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$mp" ]]; then
+      printf '%s %s\n' "$mp" "$opts"
+      return 0
+    fi
+  fi
+
+  # Fallback: parse /proc/mounts and pick the longest matching mountpoint prefix.
+  local best_mp=""
+  local best_opts=""
+  while read -r dev mp fstype opts rest; do
+    [[ -n "$mp" ]] || continue
+    if [[ "$p" == "$mp" || "$p" == "$mp"/* ]]; then
+      if [[ ${#mp} -gt ${#best_mp} ]]; then
+        best_mp="$mp"
+        best_opts="$opts"
+      fi
+    fi
+  done </proc/mounts
+
+  if [[ -n "$best_mp" ]]; then
+    printf '%s %s\n' "$best_mp" "$best_opts"
+    return 0
+  fi
+
+  return 1
+}
+
+mount_opts_have_ro() {
+  local opts="$1"
+  [[ ",$opts," == *,ro,* ]]
+}
+
+restore_remounted_mountpoints() {
+  local mp
+  for mp in "${REMOUNTED_MOUNTPOINTS[@]}"; do
+    [[ -n "$mp" ]] || continue
+    if [[ "${REMOUNT_WAS_RO[$mp]+x}" == x ]]; then
+      debug "Restoring read-only mount: $mp"
+      mount -o remount,ro "$mp" 2>/dev/null || true
+    fi
+  done
+}
+
+maybe_temp_remount_rw_for_path() {
+  # $1 = path, $2 = human label
+  local p="$1"
+  local label="$2"
+
+  [[ "$AUTO_REMOUNT_RW" == true ]] || return 0
+
+  local info mp opts
+  info="$(mount_info_for_path "$p" 2>/dev/null || true)"
+  mp="${info%% *}"
+  opts="${info#* }"
+
+  [[ -n "$mp" ]] || return 0
+
+  if mount_opts_have_ro "$opts"; then
+    # Never attempt to remount root rw in this tool.
+    if [[ "$mp" == "/" ]]; then
+      err "$label lives on a read-only root filesystem (/)."
+      err "Refusing to remount / rw. On MicroOS/Aeon, run from a writable environment (e.g. transactional-update shell) or ensure /boot(/efi) is mounted rw."
+      exit 1
+    fi
+
+    # Avoid remounting the same mountpoint multiple times.
+    if [[ -n "${REMOUNT_WAS_RO[$mp]+x}" ]]; then
+      return 0
+    fi
+
+    debug "Remounting rw: $mp (for $label)"
+    if mount -o remount,rw "$mp" 2>/dev/null; then
+      REMOUNT_WAS_RO["$mp"]=1
+      REMOUNTED_MOUNTPOINTS+=("$mp")
+      trap restore_remounted_mountpoints EXIT
+      log "${C_DIM}remount:${C_RESET} $mp -> rw (${label})"
+    else
+      err "Could not remount $mp rw (needed for $label)"
+      exit 1
+    fi
+  fi
+}
+
+kb_available_for_path() {
+  local p="$1"
+  df -Pk "$p" 2>/dev/null | awk 'NR==2 {print $4; exit}' || true
+}
+
+kb_required_for_entries_backup() {
+  # Rough estimate: entries are small, but ESP can be tight. Use a conservative multiplier.
+  local entries_kb
+  entries_kb="$(du -sk -- "$ENTRIES_DIR" 2>/dev/null | awk '{print $1}' || true)"
+  [[ "$entries_kb" =~ ^[0-9]+$ ]] || entries_kb=64
+
+  # multiplier + small fixed headroom
+  printf '%s\n' $(( entries_kb * 3 + 10240 ))
+}
+
+preflight_backup_space_or_die() {
+  local target="$1"
+  local need_kb avail_kb
+  need_kb="$(kb_required_for_entries_backup)"
+  avail_kb="$(kb_available_for_path "$target")"
+
+  [[ "$avail_kb" =~ ^[0-9]+$ ]] || return 0
+
+  if [[ "$avail_kb" -lt "$need_kb" ]]; then
+    err "Not enough free space for backups on: $target"
+    err "Need ~${need_kb}KB, have ${avail_kb}KB."
+    err "Tip: set --backup-root to a larger filesystem or use --no-backup (not recommended)."
+    exit 1
+  fi
+}
+
+main() {
+  # Allow --help/--completion without requiring root.
+  local args=("$@")
+  local i
+  for (( i=0; i<${#args[@]}; i++ )); do
+    case "${args[$i]}" in
+      -h|--help)
+        usage
+        return 0
+        ;;
+      --completion)
+        local sh="zsh"
+        if (( i+1 < ${#args[@]} )) && [[ "${args[$((i+1))]}" != --* ]]; then
+          sh="${args[$((i+1))]}"
+        fi
+        print_completion "$sh"
+        return $?
+        ;;
+    esac
+  done
+
+  # Root check
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    err "Please run as root (sudo)."
+    return 1
+  fi
+
+  ORIG_ARGC=$#
 
 # Argument parsing
 while [[ $# -gt 0 ]]; do
@@ -700,6 +949,19 @@ while [[ $# -gt 0 ]]; do
       ;;
     --rebuild-grub)
       REBUILD_GRUB=true
+      ;;
+    --update-sdboot)
+      UPDATE_SDBOOT=true
+      ;;
+    --no-remount-rw)
+      AUTO_REMOUNT_RW=false
+      ;;
+    --completion)
+      PRINT_COMPLETION=true
+      if [[ -n "${2:-}" && "${2:-}" != --* ]]; then
+        shift
+        COMPLETION_SHELL="${1:-zsh}"
+      fi
       ;;
     --grub-cfg)
       shift
@@ -852,6 +1114,8 @@ build_common_flags() {
 
   # Rebuild grub after apply operations (restore/clean)
   [[ "$REBUILD_GRUB" == true ]] && COMMON_FLAGS+=("--rebuild-grub")
+  [[ "$UPDATE_SDBOOT" == true ]] && COMMON_FLAGS+=("--update-sdboot")
+  [[ "$AUTO_REMOUNT_RW" == false ]] && COMMON_FLAGS+=("--no-remount-rw")
   if [[ "$GRUB_CFG_SET" == true ]]; then
     COMMON_FLAGS+=("--grub-cfg" "$GRUB_CFG")
   fi
@@ -978,7 +1242,9 @@ menu_paths() {
     log "5) Set log file             (currently: $LOG_FILE)"
     log "6) Toggle rebuild grub       (currently: $REBUILD_GRUB)"
     log "7) Set grub cfg path         (currently: $GRUB_CFG)"
-    log "8) Back"
+    log "8) Toggle sdbootutil update  (currently: $UPDATE_SDBOOT)"
+    log "9) Toggle auto remount rw    (currently: $AUTO_REMOUNT_RW)"
+    log "10) Back"
 
     local choice
     read -r -p "> " choice </dev/tty || return 0
@@ -1039,7 +1305,13 @@ menu_paths() {
           GRUB_CFG_SET=true
         fi
         ;;
-      8) return 0 ;;
+      8)
+        UPDATE_SDBOOT=$([[ "$UPDATE_SDBOOT" == true ]] && echo false || echo true)
+        ;;
+      9)
+        AUTO_REMOUNT_RW=$([[ "$AUTO_REMOUNT_RW" == true ]] && echo false || echo true)
+        ;;
+      10) return 0 ;;
       *) log "Invalid option." ;;
     esac
 
@@ -1520,6 +1792,31 @@ menu_settings() {
   done
 }
 
+post_apply_updates() {
+  if [[ "$REBUILD_GRUB" == true ]]; then
+    log ""
+    if command -v grub2-mkconfig >/dev/null 2>&1; then
+      log "Rebuilding GRUB menu: $GRUB_CFG"
+      grub2-mkconfig -o "$GRUB_CFG"
+      log "Done."
+    else
+      warn "--rebuild-grub requested, but grub2-mkconfig not found"
+    fi
+  fi
+
+  if [[ "$UPDATE_SDBOOT" == true ]]; then
+    log ""
+    if command -v sdbootutil >/dev/null 2>&1; then
+      log "Updating sd-boot entries: sdbootutil update-kernels"
+      if ! sdbootutil update-kernels; then
+        warn "sdbootutil update-kernels failed"
+      fi
+    else
+      warn "--update-sdboot requested, but sdbootutil not found"
+    fi
+  fi
+}
+
 # Interactive menu: if requested OR no args and running on a TTY.
 # Uses ORIG_ARGC because we've shifted args during parsing.
 if [[ "$NO_MENU" == false && -z "${SCRUB_GHOST_NO_MENU:-}" ]]; then
@@ -1574,7 +1871,11 @@ if [[ "$ACTION" == "restore" ]]; then
     exit 1
   fi
 
+  maybe_temp_remount_rw_for_path "$BACKUP_ROOT" "backup root (restore-pre backup)"
+  maybe_temp_remount_rw_for_path "$ENTRIES_DIR" "entries dir (restore target)"
+
   restore_entries_from_backup "$RESTORE_FROM"
+  post_apply_updates
   exit 0
 fi
 
@@ -1585,6 +1886,8 @@ log " Boot dir: $BOOT_DIR"
 log " Mode: $( [[ "$DRY_RUN" == true ]] && echo DRY-RUN || echo APPLY ) (${DELETE_MODE})"
 log " Auto backup:      $AUTO_BACKUP"
 log " Auto snapper:     $AUTO_SNAPPER_BACKUP"
+log " Auto remount rw:  $AUTO_REMOUNT_RW"
+log " Update sdboot:    $UPDATE_SDBOOT"
 log " Verify snapshots: $VERIFY_SNAPSHOTS (snapper: $SNAPPER_AVAILABLE)"
 log " Verify modules:   $VERIFY_KERNEL_MODULES"
 log " Prune stale snaps: $PRUNE_STALE_SNAPSHOTS"
@@ -1608,14 +1911,20 @@ ensure_backup_dir() {
 
     # Prefer a backup path OUTSIDE the entries dir so we never touch it by accident.
     # Fall back to inside ENTRIES_DIR if /var/backups isn't writable for some reason.
+    maybe_temp_remount_rw_for_path "$BACKUP_ROOT" "backup root"
     if mkdir -p -- "$BACKUP_ROOT" 2>/dev/null; then
       BACKUP_DIR="$BACKUP_ROOT/bls-entries-$ts"
     else
+      maybe_temp_remount_rw_for_path "$ENTRIES_DIR" "entries dir (fallback backup location)"
       BACKUP_DIR="$ENTRIES_DIR/.scrub-ghost-backup-$ts"
     fi
   fi
 
+  maybe_temp_remount_rw_for_path "$BACKUP_DIR" "backup dir"
   mkdir -p -- "$BACKUP_DIR"
+
+  # Ensure we have space for a full copy of entries (and moved files).
+  preflight_backup_space_or_die "$BACKUP_DIR"
 
   # Point latest -> this backup dir (best effort)
   if [[ "$BACKUP_DIR" == "$BACKUP_ROOT"/* ]]; then
@@ -1671,8 +1980,10 @@ snapper_backup_snapshot() {
   fi
 }
 
-# If applying changes, create backups BEFORE touching entries.
+# If applying changes, ensure writable mounts and create backups BEFORE touching entries.
 if [[ "$DRY_RUN" == false ]]; then
+  maybe_temp_remount_rw_for_path "$ENTRIES_DIR" "entries dir"
+
   if [[ "$AUTO_SNAPPER_BACKUP" == true ]]; then
     snapper_backup_snapshot
   fi
@@ -1746,10 +2057,34 @@ for entry in "$ENTRIES_DIR"/*.conf; do
     fi
   fi
 
-  # Kernel image missing -> ghost.
+  # initrd/devicetree checks (if referenced)
+  initrd_path="$(bls_initrd_path "$entry")"
+  initrd_full=""
+  missing_initrd=false
+  if [[ -n "$initrd_path" ]]; then
+    initrd_full="$(resolve_boot_path "$initrd_path" || true)"
+    if [[ -z "$initrd_full" || ! -e "$initrd_full" ]]; then
+      missing_initrd=true
+    fi
+  fi
+
+  devicetree_path="$(bls_devicetree_path "$entry")"
+  devicetree_full=""
+  missing_devicetree=false
+  if [[ -n "$devicetree_path" ]]; then
+    devicetree_full="$(resolve_boot_path "$devicetree_path" || true)"
+    if [[ -z "$devicetree_full" || ! -e "$devicetree_full" ]]; then
+      missing_devicetree=true
+    fi
+  fi
+
+  missing_kernel=false
   if [[ ! -e "$kernel_full" ]]; then
-    :
-  else
+    missing_kernel=true
+  fi
+
+  # If nothing is missing, entry is potentially OK (then check stale snapshot / uninstalled-kernel).
+  if [[ "$missing_kernel" == false && "$missing_initrd" == false && "$missing_devicetree" == false ]]; then
     # Kernel image exists, but we may still want to flag stale snapper/uninstalled kernels.
     if [[ -n "$snap_num" && "$VERIFY_SNAPSHOTS" == true && "$snap_present" == false ]]; then
       stale_snapshot_count=$((stale_snapshot_count + 1))
@@ -1819,7 +2154,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
     continue
   fi
 
-  # Kernel missing -> likely a ghost entry.
+  # Something missing -> likely a ghost/broken entry.
   ghost_count=$((ghost_count + 1))
 
   log ""
@@ -1834,6 +2169,19 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   fi
   log "        linux:   $kernel_path"
   log "        lookup:  $kernel_full"
+  if [[ -n "${initrd_path:-}" ]]; then
+    log "        initrd:  $initrd_path"
+    log "        lookup:  ${initrd_full:-<unresolved>}"
+  fi
+  if [[ -n "${devicetree_path:-}" ]]; then
+    log "        dtb:     $devicetree_path"
+    log "        lookup:  ${devicetree_full:-<unresolved>}"
+  fi
+  miss_list=""
+  [[ "${missing_kernel:-false}" == true ]] && miss_list+=" kernel"
+  [[ "${missing_initrd:-false}" == true ]] && miss_list+=" initrd"
+  [[ "${missing_devicetree:-false}" == true ]] && miss_list+=" devicetree"
+  [[ -n "$miss_list" ]] && log "        missing:${miss_list}"
 
   if [[ "$snap_present" == true ]]; then
     if [[ -n "$snap_num" ]]; then
@@ -1911,13 +2259,12 @@ else
 fi
 log "========================================"
 
-if [[ "$DRY_RUN" == false && "$REBUILD_GRUB" == true ]]; then
-  log ""
-  if command -v grub2-mkconfig >/dev/null 2>&1; then
-    log "Rebuilding GRUB menu: $GRUB_CFG"
-    grub2-mkconfig -o "$GRUB_CFG"
-    log "Done."
-  else
-    warn "--rebuild-grub requested, but grub2-mkconfig not found"
-  fi
+if [[ "$DRY_RUN" == false ]]; then
+  post_apply_updates
+fi
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+  exit $?
 fi
