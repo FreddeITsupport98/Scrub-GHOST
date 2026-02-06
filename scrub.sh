@@ -50,6 +50,10 @@ LATEST_INSTALLED_VER=""
 COLOR=true
 VERBOSE=false
 
+# Machine-readable output
+JSON_OUTPUT=false
+LOG_TO_STDERR=false
+
 # Logging
 DEBUG=false
 LOG_FILE="/var/log/scrub-ghost.log"
@@ -68,6 +72,7 @@ VERIFY_SNAPSHOTS=true
 VERIFY_KERNEL_MODULES=true
 PRUNE_STALE_SNAPSHOTS=false
 PRUNE_UNINSTALLED_KERNELS=false
+PRUNE_DUPLICATES=false
 CONFIRM_PRUNE_UNINSTALLED=false
 
 # Backup knobs (enabled automatically when applying changes)
@@ -102,6 +107,7 @@ Options:
   --update-sdboot        Run sdbootutil update-kernels after changes (optional)
   --no-remount-rw        Do not attempt temporary remount rw when entries/backup live on a read-only FS
   --completion [SHELL]   Print a shell completion script (SHELL: zsh|bash; default: zsh) and exit
+  --json                 Emit machine-readable JSON to stdout (logs go to stderr; implies --no-color)
   --no-color             Disable colored output
   --verbose              Print extra details (including validation failures in --list-backups)
   --debug                Enable debug logging
@@ -133,6 +139,7 @@ Verification / pruning (all safe by default; pruning requires --force):
   --no-verify-modules     Don't verify kernel modules dirs for the entry's kernel version
   --prune-stale-snapshots Move/delete snapper entries whose snapshot number doesn't exist
   --prune-uninstalled     Move/delete entries whose kernel modules dir is missing (requires --confirm-uninstalled)
+  --prune-duplicates      Move/delete duplicate entries with identical boot payload (linux+initrd+options)
   --confirm-uninstalled   Required extra safety flag to actually prune uninstalled-kernel entries
 
   -h, --help             Show this help
@@ -169,6 +176,7 @@ _arguments -s \
   '--grub-cfg=[grub2-mkconfig output path]:file:_files' \
   '--update-sdboot[run sdbootutil update-kernels after changes]' \
   '--no-remount-rw[do not attempt temporary remount rw]' \
+  '--json[emit machine-readable JSON to stdout]' \
   '--no-color[disable colored output]' \
   '--verbose[verbose output]' \
   '--debug[debug logging]' \
@@ -190,6 +198,7 @@ _arguments -s \
   '--no-verify-modules[disable kernel modules verification]' \
   '--prune-stale-snapshots[prune stale snapper entries (requires --force)]' \
   '--prune-uninstalled[prune uninstalled-kernel entries (requires --confirm-uninstalled)]' \
+  '--prune-duplicates[prune duplicate boot entries]' \
   '--confirm-uninstalled[extra confirmation for --prune-uninstalled]' \
   '--completion=[print completion script]:shell:(zsh bash)'
 EOF
@@ -200,7 +209,7 @@ EOF
 _scrub_ghost_complete() {
   local cur
   cur="${COMP_WORDS[COMP_CWORD]}"
-  local opts="--dry-run --force --delete --backup-dir --backup-root --keep-backups --entries-dir --boot-dir --rebuild-grub --grub-cfg --update-sdboot --no-remount-rw --no-color --verbose --debug --log-file --menu --list-backups --restore-latest --restore-best --restore-pick --restore-from --clean-restore --restore-anyway --validate-latest --validate-pick --validate-from --no-backup --no-snapper-backup --no-verify-snapshots --no-verify-modules --prune-stale-snapshots --prune-uninstalled --confirm-uninstalled --completion --help"
+  local opts="--dry-run --force --delete --backup-dir --backup-root --keep-backups --entries-dir --boot-dir --rebuild-grub --grub-cfg --update-sdboot --no-remount-rw --json --no-color --verbose --debug --log-file --menu --list-backups --restore-latest --restore-best --restore-pick --restore-from --clean-restore --restore-anyway --validate-latest --validate-pick --validate-from --no-backup --no-snapper-backup --no-verify-snapshots --no-verify-modules --prune-stale-snapshots --prune-uninstalled --prune-duplicates --confirm-uninstalled --completion --help"
   COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
 }
 
@@ -278,11 +287,19 @@ init_colors() {
 }
 
 log() {
-  printf '%b\n' "$*"
+  if [[ "$LOG_TO_STDERR" == true ]]; then
+    printf '%b\n' "$*" >&2
+  else
+    printf '%b\n' "$*"
+  fi
   log_to_file "$*"
 }
 warn() {
-  printf '%bWARN:%b %s\n' "$C_YELLOW" "$C_RESET" "$*"
+  if [[ "$LOG_TO_STDERR" == true ]]; then
+    printf '%bWARN:%b %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2
+  else
+    printf '%bWARN:%b %s\n' "$C_YELLOW" "$C_RESET" "$*"
+  fi
   log_to_file "WARN: $*"
 }
 err() {
@@ -291,9 +308,66 @@ err() {
 }
 debug() {
   if [[ "$DEBUG" == true ]]; then
-    printf '%bDEBUG:%b %s\n' "$C_BLUE" "$C_RESET" "$*"
+    if [[ "$LOG_TO_STDERR" == true ]]; then
+      printf '%bDEBUG:%b %s\n' "$C_BLUE" "$C_RESET" "$*" >&2
+    else
+      printf '%bDEBUG:%b %s\n' "$C_BLUE" "$C_RESET" "$*"
+    fi
     log_to_file "DEBUG: $*"
   fi
+}
+
+log_audit() {
+  # Sends critical actions to the system journal (best effort)
+  local msg="$1"
+  if command -v logger >/dev/null 2>&1; then
+    logger -t "scrub-ghost" -p user.notice -- "$msg" 2>/dev/null || true
+  fi
+}
+
+json_escape() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//"/\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+json_add_result() {
+  # Args: file status kernel initrd devicetree snapshot kver action details
+  [[ "$JSON_OUTPUT" == true ]] || return 0
+
+  local file="$1" status="$2" kernel="$3" initrd="$4" dtb="$5" snap="$6" kver="$7" action="$8" details="$9"
+
+  JSON_RESULTS+=(
+    "{\"file\":\"$(json_escape "$file")\",\"status\":\"$(json_escape "$status")\",\"kernel\":\"$(json_escape "$kernel")\",\"initrd\":\"$(json_escape "$initrd")\",\"devicetree\":\"$(json_escape "$dtb")\",\"snapshot\":\"$(json_escape "$snap")\",\"kver\":\"$(json_escape "$kver")\",\"action\":\"$(json_escape "$action")\",\"details\":\"$(json_escape "$details")\"}"
+  )
+}
+
+json_emit() {
+  [[ "$JSON_OUTPUT" == true ]] || return 0
+
+  printf '{"timestamp":"%s","entries_dir":"%s","boot_dir":"%s","mode":"%s","delete_mode":"%s","results":[' \
+    "$(date -Is)" "$(json_escape "$ENTRIES_DIR")" "$(json_escape "$BOOT_DIR")" \
+    "$( [[ "$DRY_RUN" == true ]] && echo DRY-RUN || echo APPLY )" "$(json_escape "$DELETE_MODE")"
+
+  local first=true
+  local item
+  for item in "${JSON_RESULTS[@]}"; do
+    if [[ "$first" == true ]]; then
+      first=false
+    else
+      printf ','
+    fi
+    printf '%s' "$item"
+  done
+
+  printf '],"summary":{"ok":%d,"ghost":%d,"stale_snapshot":%d,"uninstalled_kernel":%d,"duplicate_found":%d,"duplicate_pruned":%d,"protected_snapshots":%d,"protected_kernels":%d,"skipped":%d,"changed":%d}}\n' \
+    "$ok_count" "$ghost_count" "$stale_snapshot_count" "$uninstalled_kernel_count" \
+    "$duplicate_found_count" "$duplicate_pruned_count" "$protected_count" "$protected_kernel_count" \
+    "$skipped_count" "$moved_or_deleted_count"
 }
 
 ts_now() { date +%Y%m%d-%H%M%S; }
@@ -319,9 +393,37 @@ bls_get_path() {
   ' "$file" 2>/dev/null || true
 }
 
+bls_get_rest_of_line() {
+  # $1 = key regex, $2 = file
+  # Prints everything after the key token (used for "options" lines).
+  local key_re="$1"
+  local file="$2"
+  awk -v re="$key_re" '
+    /^[[:space:]]*#/ {next}
+    $1 ~ re {
+      $1=""
+      sub(/^[[:space:]]+/, "")
+      print
+      exit
+    }
+  ' "$file" 2>/dev/null || true
+}
+
 bls_linux_path() { bls_get_path '^linux(efi)?$' "$1"; }
 bls_initrd_path() { bls_get_path '^initrd$' "$1"; }
 bls_devicetree_path() { bls_get_path '^devicetree$' "$1"; }
+bls_options_line() { bls_get_rest_of_line '^options$' "$1"; }
+
+payload_signature() {
+  # Stable signature for duplicate detection
+  local raw="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$raw" | sha256sum | awk '{print $1}'
+  else
+    # Fallback (still works, but can be large)
+    printf '%s' "$raw"
+  fi
+}
 
 # Kernel guardrails
 compute_kernel_guardrails() {
@@ -516,7 +618,7 @@ validate_backup_bootability() {
     kp="$(bls_linux_path "$f")"
     local kfull
     kfull="$(resolve_boot_path "$kp" || true)"
-    if [[ -z "$kfull" || ! -e "$kfull" ]]; then
+    if [[ -z "$kfull" || ! -s "$kfull" ]]; then
       missing_kernel=$((missing_kernel + 1))
     fi
 
@@ -525,7 +627,7 @@ validate_backup_bootability() {
     if [[ -n "$ip" ]]; then
       local ifull
       ifull="$(resolve_boot_path "$ip" || true)"
-      if [[ -z "$ifull" || ! -e "$ifull" ]]; then
+      if [[ -z "$ifull" || ! -s "$ifull" ]]; then
         missing_initrd=$((missing_initrd + 1))
       fi
     fi
@@ -535,7 +637,7 @@ validate_backup_bootability() {
     if [[ -n "$dtp" ]]; then
       local dtfull
       dtfull="$(resolve_boot_path "$dtp" || true)"
-      if [[ -z "$dtfull" || ! -e "$dtfull" ]]; then
+      if [[ -z "$dtfull" || ! -s "$dtfull" ]]; then
         missing_dt=$((missing_dt + 1))
       fi
     fi
@@ -915,6 +1017,9 @@ while [[ $# -gt 0 ]]; do
     --no-color)
       COLOR=false
       ;;
+    --json)
+      JSON_OUTPUT=true
+      ;;
     --dry-run)
       DRY_RUN=true
       ;;
@@ -1032,6 +1137,9 @@ while [[ $# -gt 0 ]]; do
     --prune-uninstalled)
       PRUNE_UNINSTALLED_KERNELS=true
       ;;
+    --prune-duplicates)
+      PRUNE_DUPLICATES=true
+      ;;
     --confirm-uninstalled)
       CONFIRM_PRUNE_UNINSTALLED=true
       ;;
@@ -1072,6 +1180,17 @@ if [[ ! -d "$BOOT_DIR" ]]; then
   warn "Boot root dir not found: $BOOT_DIR (path checks may be wrong)"
 fi
 
+# If JSON output is enabled, keep stdout machine-readable by sending logs to stderr.
+# (Only supported for the main scan/apply flow; not for list/validate/restore subcommands.)
+if [[ "$JSON_OUTPUT" == true ]]; then
+  if [[ "$ACTION" != "scan" ]]; then
+    JSON_OUTPUT=false
+  else
+    COLOR=false
+    LOG_TO_STDERR=true
+  fi
+fi
+
 # Initialize colors/logging once we parsed flags.
 init_colors
 init_logging
@@ -1101,6 +1220,7 @@ build_common_flags() {
   COMMON_FLAGS=()
 
   [[ "$COLOR" == false ]] && COMMON_FLAGS+=("--no-color")
+  [[ "$JSON_OUTPUT" == true ]] && COMMON_FLAGS+=("--json")
   [[ "$VERBOSE" == true ]] && COMMON_FLAGS+=("--verbose")
   [[ "$DEBUG" == true ]] && COMMON_FLAGS+=("--debug")
 
@@ -1126,6 +1246,7 @@ build_common_flags() {
 
   [[ "$VERIFY_SNAPSHOTS" == false ]] && COMMON_FLAGS+=("--no-verify-snapshots")
   [[ "$VERIFY_KERNEL_MODULES" == false ]] && COMMON_FLAGS+=("--no-verify-modules")
+  [[ "$PRUNE_DUPLICATES" == true ]] && COMMON_FLAGS+=("--prune-duplicates")
 
   # Keep using same backup root if user changed it
   [[ -n "$BACKUP_ROOT" ]] && COMMON_FLAGS+=("--backup-root" "$BACKUP_ROOT")
@@ -1162,7 +1283,8 @@ menu_clean() {
     log "2) Remove ghosts only"
     log "3) Prune stale Snapper + uninstalled-kernel entries (requires YES)"
     log "4) Prune uninstalled-kernel entries only (requires YES)"
-    log "5) Back"
+    log "5) Prune duplicate entries (linux+initrd+options)"
+    log "6) Back"
 
     local choice
     read -r -p "> " choice </dev/tty || return 0
@@ -1199,6 +1321,10 @@ menu_clean() {
         prompt_enter_to_continue
         ;;
       5)
+        run_sub --force --prune-duplicates
+        prompt_enter_to_continue
+        ;;
+      6)
         return 0
         ;;
       *)
@@ -1784,8 +1910,10 @@ menu_settings() {
     log "5) Toggle verify modules   (currently: $VERIFY_KERNEL_MODULES)"
     log "6) Toggle auto backup      (currently: $AUTO_BACKUP)"
     log "7) Toggle auto snapper     (currently: $AUTO_SNAPPER_BACKUP)"
-    log "8) Set keep backups (currently: $KEEP_BACKUPS)"
-    log "9) Back"
+    log "8) Toggle prune duplicates (currently: $PRUNE_DUPLICATES)"
+    log "9) Toggle JSON output      (currently: $JSON_OUTPUT)"
+    log "10) Set keep backups (currently: $KEEP_BACKUPS)"
+    log "11) Back"
 
     local choice
     read -r -p "> " choice </dev/tty || return 0
@@ -1798,7 +1926,15 @@ menu_settings() {
       5) VERIFY_KERNEL_MODULES=$([[ "$VERIFY_KERNEL_MODULES" == true ]] && echo false || echo true) ;;
       6) AUTO_BACKUP=$([[ "$AUTO_BACKUP" == true ]] && echo false || echo true) ;;
       7) AUTO_SNAPPER_BACKUP=$([[ "$AUTO_SNAPPER_BACKUP" == true ]] && echo false || echo true) ;;
-      8)
+      8) PRUNE_DUPLICATES=$([[ "$PRUNE_DUPLICATES" == true ]] && echo false || echo true) ;;
+      9)
+        JSON_OUTPUT=$([[ "$JSON_OUTPUT" == true ]] && echo false || echo true)
+        if [[ "$JSON_OUTPUT" == true ]]; then
+          COLOR=false
+          init_colors
+        fi
+        ;;
+      10)
         local n
         read -r -p "Keep how many backups? (0 disables rotation): " n </dev/tty || true
         if [[ "$n" =~ ^[0-9]+$ ]]; then
@@ -1807,7 +1943,7 @@ menu_settings() {
           log "Invalid number."
         fi
         ;;
-      9) return 0 ;;
+      11) return 0 ;;
       *) log "Invalid option." ;;
     esac
 
@@ -1915,6 +2051,8 @@ log " Verify snapshots: $VERIFY_SNAPSHOTS (snapper: $SNAPPER_AVAILABLE)"
 log " Verify modules:   $VERIFY_KERNEL_MODULES"
 log " Prune stale snaps: $PRUNE_STALE_SNAPSHOTS"
 log " Prune uninstalled: $PRUNE_UNINSTALLED_KERNELS (confirm: $CONFIRM_PRUNE_UNINSTALLED)"
+log " Prune duplicates:  $PRUNE_DUPLICATES"
+log " JSON output:       $JSON_OUTPUT"
 log "========================================"
 
 ok_count=0
@@ -1924,8 +2062,15 @@ protected_kernel_count=0
 critical_kernel_count=0
 stale_snapshot_count=0
 uninstalled_kernel_count=0
+duplicate_found_count=0
+duplicate_pruned_count=0
 moved_or_deleted_count=0
 skipped_count=0
+
+declare -A SEEN_PAYLOADS
+
+declare -a JSON_RESULTS
+JSON_RESULTS=()
 
 ensure_backup_dir() {
   if [[ -z "$BACKUP_DIR" ]]; then
@@ -2031,6 +2176,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   if [[ -z "$kernel_path" ]]; then
     warn "Skipping (no linux/linuxefi line): $(basename -- "$entry")"
     skipped_count=$((skipped_count + 1))
+    json_add_result "$(basename -- "$entry")" "SKIPPED" "" "" "" "" "" "SKIP" "no linux/linuxefi line"
     continue
   fi
 
@@ -2038,6 +2184,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   if [[ -z "$kernel_full" ]]; then
     warn "Skipping (could not resolve kernel path): $(basename -- "$entry")"
     skipped_count=$((skipped_count + 1))
+    json_add_result "$(basename -- "$entry")" "SKIPPED" "$kernel_path" "" "" "${snap_num:-}" "${entry_kver:-}" "SKIP" "could not resolve kernel path"
     continue
   fi
 
@@ -2086,7 +2233,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   missing_initrd=false
   if [[ -n "$initrd_path" ]]; then
     initrd_full="$(resolve_boot_path "$initrd_path" || true)"
-    if [[ -z "$initrd_full" || ! -e "$initrd_full" ]]; then
+    if [[ -z "$initrd_full" || ! -s "$initrd_full" ]]; then
       missing_initrd=true
     fi
   fi
@@ -2096,40 +2243,106 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   missing_devicetree=false
   if [[ -n "$devicetree_path" ]]; then
     devicetree_full="$(resolve_boot_path "$devicetree_path" || true)"
-    if [[ -z "$devicetree_full" || ! -e "$devicetree_full" ]]; then
+    if [[ -z "$devicetree_full" || ! -s "$devicetree_full" ]]; then
       missing_devicetree=true
     fi
   fi
 
   missing_kernel=false
+  corrupt_kernel=false
   if [[ ! -e "$kernel_full" ]]; then
+    missing_kernel=true
+  elif [[ ! -s "$kernel_full" ]]; then
+    corrupt_kernel=true
     missing_kernel=true
   fi
 
-  # If nothing is missing, entry is potentially OK (then check stale snapshot / uninstalled-kernel).
+  # If nothing is missing, entry is potentially OK (then check duplicates / stale snapshot / uninstalled-kernel).
   if [[ "$missing_kernel" == false && "$missing_initrd" == false && "$missing_devicetree" == false ]]; then
+
+    # Duplicate detection/pruning: hash the functional payload (linux+initrd+options).
+    # Snapshot entries are treated as protected when the snapshot exists.
+    local entry_options payload_raw payload_sig
+    entry_options="$(bls_options_line "$entry")"
+    payload_raw="${kernel_path}|${initrd_path}|${entry_options}"
+    payload_sig="$(payload_signature "$payload_raw")"
+
+    if [[ -n "${SEEN_PAYLOADS[$payload_sig]+x}" ]]; then
+      duplicate_found_count=$((duplicate_found_count + 1))
+      log "${C_YELLOW}[DUPLICATE]${C_RESET} $(basename -- "$entry")"
+      log "        matches: ${SEEN_PAYLOADS[$payload_sig]}"
+
+      if [[ "$PRUNE_DUPLICATES" == true ]]; then
+        if [[ "$snap_present" == true ]]; then
+          log "        action:  ${C_BLUE}SKIP${C_RESET} (protected snapshot entry)"
+          json_add_result "$(basename -- "$entry")" "DUPLICATE" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "protected snapshot entry"
+          continue
+        fi
+        if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true ]]; then
+          log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel)"
+          json_add_result "$(basename -- "$entry")" "DUPLICATE" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "protected kernel"
+          continue
+        fi
+
+        if [[ "$DRY_RUN" == true ]]; then
+          log "        action:  (dry-run) would prune duplicate"
+          json_add_result "$(basename -- "$entry")" "DUPLICATE" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "DRYRUN" "would prune duplicate"
+          continue
+        fi
+
+        log "        action:  pruning duplicate"
+        if [[ "$DELETE_MODE" == "delete" ]]; then
+          log_audit "ACTION=DELETE file=$entry reason=duplicate matches=${SEEN_PAYLOADS[$payload_sig]}"
+          rm -f -- "$entry"
+          moved_or_deleted_count=$((moved_or_deleted_count + 1))
+          duplicate_pruned_count=$((duplicate_pruned_count + 1))
+          json_add_result "$(basename -- "$entry")" "DUPLICATE" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "DELETE" "duplicate"
+        else
+          ensure_backup_dir
+          log_audit "ACTION=MOVE file=$entry dest=$BACKUP_DIR reason=duplicate matches=${SEEN_PAYLOADS[$payload_sig]}"
+          mv -- "$entry" "$BACKUP_DIR/"
+          moved_or_deleted_count=$((moved_or_deleted_count + 1))
+          duplicate_pruned_count=$((duplicate_pruned_count + 1))
+          json_add_result "$(basename -- "$entry")" "DUPLICATE" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "MOVE" "duplicate"
+        fi
+        continue
+      fi
+
+      log "        note:    enable --prune-duplicates to remove duplicates"
+      json_add_result "$(basename -- "$entry")" "DUPLICATE" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "NONE" "duplicate"
+      continue
+    else
+      SEEN_PAYLOADS["$payload_sig"]="$(basename -- "$entry")"
+    fi
+
     # Kernel image exists, but we may still want to flag stale snapper/uninstalled kernels.
     if [[ -n "$snap_num" && "$VERIFY_SNAPSHOTS" == true && "$snap_present" == false ]]; then
       stale_snapshot_count=$((stale_snapshot_count + 1))
       log "${C_RED}[STALE-SNAPSHOT]${C_RESET} $(basename -- "$entry") ${C_DIM}(snapshot #$snap_num not present)${C_RESET}"
 
       if [[ "$DRY_RUN" == true || "$PRUNE_STALE_SNAPSHOTS" == false ]]; then
+        json_add_result "$(basename -- "$entry")" "STALE-SNAPSHOT" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "snapshot missing"
         continue
       fi
 
       if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true ]]; then
         log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel: ${entry_kver:-unknown})"
         protected_kernel_count=$((protected_kernel_count + 1))
+        json_add_result "$(basename -- "$entry")" "STALE-SNAPSHOT" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "protected kernel"
         continue
       fi
 
       # Apply pruning (move/delete) for stale snapshot entries
       log "        action:  pruning stale snapshot entry"
       if [[ "$DELETE_MODE" == "delete" ]]; then
+        log_audit "ACTION=DELETE file=$entry reason=stale-snapshot snapshot=${snap_num:-}"
         rm -f -- "$entry"
+        json_add_result "$(basename -- "$entry")" "STALE-SNAPSHOT" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "DELETE" "stale snapshot"
       else
         ensure_backup_dir
+        log_audit "ACTION=MOVE file=$entry dest=$BACKUP_DIR reason=stale-snapshot snapshot=${snap_num:-}"
         mv -- "$entry" "$BACKUP_DIR/"
+        json_add_result "$(basename -- "$entry")" "STALE-SNAPSHOT" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "MOVE" "stale snapshot"
       fi
       moved_or_deleted_count=$((moved_or_deleted_count + 1))
       continue
@@ -2144,21 +2357,27 @@ for entry in "$ENTRIES_DIR"/*.conf; do
       fi
 
       if [[ "$DRY_RUN" == true || "$PRUNE_UNINSTALLED_KERNELS" == false || "$CONFIRM_PRUNE_UNINSTALLED" == false ]]; then
+        json_add_result "$(basename -- "$entry")" "UNINSTALLED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${kver:-}" "SKIP" "modules missing"
         continue
       fi
 
       if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true ]]; then
         log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel: ${entry_kver:-unknown})"
         protected_kernel_count=$((protected_kernel_count + 1))
+        json_add_result "$(basename -- "$entry")" "UNINSTALLED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${kver:-}" "SKIP" "protected kernel"
         continue
       fi
 
       log "        action:  pruning uninstalled-kernel entry"
       if [[ "$DELETE_MODE" == "delete" ]]; then
+        log_audit "ACTION=DELETE file=$entry reason=uninstalled-kernel kver=${kver:-}"
         rm -f -- "$entry"
+        json_add_result "$(basename -- "$entry")" "UNINSTALLED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${kver:-}" "DELETE" "uninstalled kernel"
       else
         ensure_backup_dir
+        log_audit "ACTION=MOVE file=$entry dest=$BACKUP_DIR reason=uninstalled-kernel kver=${kver:-}"
         mv -- "$entry" "$BACKUP_DIR/"
+        json_add_result "$(basename -- "$entry")" "UNINSTALLED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${kver:-}" "MOVE" "uninstalled kernel"
       fi
       moved_or_deleted_count=$((moved_or_deleted_count + 1))
       continue
@@ -2170,8 +2389,14 @@ for entry in "$ENTRIES_DIR"/*.conf; do
       [[ "$is_latest_kernel" == true ]] && prot_reason+="latest "
       log "${C_BLUE}[PROTECTED]${C_RESET} $(basename -- "$entry") ${C_DIM}(${prot_reason}kernel: ${entry_kver:-unknown})${C_RESET}"
       protected_kernel_count=$((protected_kernel_count + 1))
+      json_add_result "$(basename -- "$entry")" "PROTECTED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "NONE" "${prot_reason}kernel"
     else
       log "${C_GREEN}[OK]${C_RESET}   $(basename -- "$entry")"
+      if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true ]]; then
+        json_add_result "$(basename -- "$entry")" "PROTECTED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "NONE" "kernel protected"
+      else
+        json_add_result "$(basename -- "$entry")" "OK" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "NONE" ""
+      fi
     fi
     ok_count=$((ok_count + 1))
     continue
@@ -2181,7 +2406,17 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   ghost_count=$((ghost_count + 1))
 
   log ""
-  if [[ "$is_running_kernel" == true ]]; then
+  if [[ "${corrupt_kernel:-false}" == true ]]; then
+    if [[ "$is_running_kernel" == true ]]; then
+      log "${C_RED}[CORRUPT-RUNNING]${C_RESET} $(basename -- "$entry") ${C_DIM}(kernel file is 0 bytes; running kernel: ${entry_kver:-unknown})${C_RESET}"
+      critical_kernel_count=$((critical_kernel_count + 1))
+    elif [[ "$is_latest_kernel" == true ]]; then
+      log "${C_RED}[CORRUPT-LATEST]${C_RESET} $(basename -- "$entry") ${C_DIM}(kernel file is 0 bytes; latest installed kernel: ${entry_kver:-unknown})${C_RESET}"
+      protected_kernel_count=$((protected_kernel_count + 1))
+    else
+      log "${C_RED}[CORRUPT]${C_RESET} $(basename -- "$entry") ${C_DIM}(kernel file is 0 bytes)${C_RESET}"
+    fi
+  elif [[ "$is_running_kernel" == true ]]; then
     log "${C_RED}[CRITICAL-GHOST]${C_RESET} $(basename -- "$entry") ${C_DIM}(running kernel: ${entry_kver:-unknown})${C_RESET}"
     critical_kernel_count=$((critical_kernel_count + 1))
   elif [[ "$is_latest_kernel" == true ]]; then
@@ -2202,6 +2437,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   fi
   miss_list=""
   [[ "${missing_kernel:-false}" == true ]] && miss_list+=" kernel"
+  [[ "${corrupt_kernel:-false}" == true ]] && miss_list+=" corrupt-kernel"
   [[ "${missing_initrd:-false}" == true ]] && miss_list+=" initrd"
   [[ "${missing_devicetree:-false}" == true ]] && miss_list+=" devicetree"
   [[ -n "$miss_list" ]] && log "        missing:${miss_list}"
@@ -2214,17 +2450,24 @@ for entry in "$ENTRIES_DIR"/*.conf; do
     fi
     log "        action:  ${C_BLUE}SKIP${C_RESET} (protected snapshot entry)"
     protected_count=$((protected_count + 1))
+    json_add_result "$(basename -- "$entry")" "PROTECTED-SNAPSHOT" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "snapshot exists"
     continue
   fi
 
   if [[ "$DRY_RUN" == true ]]; then
+    local status
+    status=$([[ "${corrupt_kernel:-false}" == true ]] && echo "CORRUPT" || echo "GHOST")
+
     if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true ]]; then
       log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel: ${entry_kver:-unknown})"
+      json_add_result "$(basename -- "$entry")" "PROTECTED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "$status (protected kernel)"
     else
       if [[ "$DELETE_MODE" == "delete" ]]; then
         log "        action:  (dry-run) would DELETE"
+        json_add_result "$(basename -- "$entry")" "$status" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "DRYRUN" "would delete"
       else
         log "        action:  (dry-run) would MOVE to backup"
+        json_add_result "$(basename -- "$entry")" "$status" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "DRYRUN" "would move"
       fi
     fi
     continue
@@ -2233,18 +2476,26 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true ]]; then
     log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel: ${entry_kver:-unknown})"
     protected_kernel_count=$((protected_kernel_count + 1))
+    json_add_result "$(basename -- "$entry")" "PROTECTED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "ghost/corrupt but protected kernel"
     continue
   fi
 
+  local status
+  status=$([[ "${corrupt_kernel:-false}" == true ]] && echo "CORRUPT" || echo "GHOST")
+
   if [[ "$DELETE_MODE" == "delete" ]]; then
     log "        action:  deleting entry file"
+    log_audit "ACTION=DELETE file=$entry reason=$status missing=${miss_list# }"
     rm -f -- "$entry"
     moved_or_deleted_count=$((moved_or_deleted_count + 1))
+    json_add_result "$(basename -- "$entry")" "$status" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "DELETE" "missing:${miss_list}"
   else
     ensure_backup_dir
     log "        action:  moving entry file -> $BACKUP_DIR"
+    log_audit "ACTION=MOVE file=$entry dest=$BACKUP_DIR reason=$status missing=${miss_list# }"
     mv -- "$entry" "$BACKUP_DIR/"
     moved_or_deleted_count=$((moved_or_deleted_count + 1))
+    json_add_result "$(basename -- "$entry")" "$status" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "MOVE" "missing:${miss_list}"
   fi
 
 done
@@ -2259,6 +2510,8 @@ log "   Protected kernels:    $protected_kernel_count"
 log "   Critical kernels:     $critical_kernel_count"
 log "   Stale snapshots:      $stale_snapshot_count"
 log "   Uninstalled kernels:  $uninstalled_kernel_count"
+log "   Duplicates found:     $duplicate_found_count"
+log "   Duplicates pruned:    $duplicate_pruned_count"
 log "   Skipped (malformed):  $skipped_count"
 if [[ "$DRY_RUN" == false ]]; then
   log "   Changed:              $moved_or_deleted_count"
@@ -2284,6 +2537,10 @@ log "========================================"
 
 if [[ "$DRY_RUN" == false ]]; then
   post_apply_updates
+fi
+
+if [[ "$JSON_OUTPUT" == true ]]; then
+  json_emit
 fi
 }
 

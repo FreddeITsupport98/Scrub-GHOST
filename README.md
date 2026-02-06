@@ -117,6 +117,12 @@ Also prune stale snapper snapshot entries:
 Prune entries for kernels not installed anymore (requires confirmation):
 - `sudo ./scrub.sh --force --prune-uninstalled --confirm-uninstalled`
 
+Prune duplicate entries (same linux+initrd+options payload):
+- `sudo ./scrub.sh --force --prune-duplicates`
+
+Machine-readable output (JSON to stdout; logs go to stderr):
+- `sudo ./scrub.sh --dry-run --json`
+
 Hard delete (dangerous):
 - `sudo ./scrub.sh --delete [--prune-stale-snapshots] [--prune-uninstalled --confirm-uninstalled]`
 
@@ -213,6 +219,8 @@ Remove hook:
 
 ## Notes
 - Ghost/broken entry detection checks not only the `linux` path but also `initrd` (if present) and `devicetree` (if present). If any referenced file is missing, the entry is flagged as a ghost/broken entry.
+- **Corruption detection:** a kernel file that exists but is **0 bytes** is treated as broken (common when the ESP runs out of space).
+- **Auditing:** when the tool moves/deletes entries, it also writes best-effort audit lines to the system journal via `logger` (tag: `scrub-ghost`).
 - On read-only systems (MicroOS/Aeon), when applying changes the tool will try a temporary remount `rw` for the mountpoints containing the entries directory and backup root, then restore `ro` on exit. Disable this behavior with `--no-remount-rw`.
 - `git` is not required to run the tool.
 - You should treat `--delete`, `--clean-restore`, and `--restore-anyway` as danger flags.
