@@ -23,6 +23,22 @@ BACKUP_DIR=""        # if empty, a timestamped dir under ENTRIES_DIR will be use
 REBUILD_GRUB=false
 GRUB_CFG="/boot/grub2/grub.cfg"
 
+# Verification / pruning knobs
+VERIFY_SNAPSHOTS=true
+VERIFY_KERNEL_MODULES=true
+PRUNE_STALE_SNAPSHOTS=false
+PRUNE_UNINSTALLED_KERNELS=false
+CONFIRM_PRUNE_UNINSTALLED=false
+
+# Backup knobs (enabled automatically when applying changes)
+AUTO_BACKUP=true
+AUTO_SNAPPER_BACKUP=true
+SNAPPER_BACKUP_ID=""
+
+# Filled at runtime (if snapper exists)
+declare -A SNAPSHOT_NUM_SET
+SNAPPER_AVAILABLE=false
+
 usage() {
   cat <<'USAGE'
 Usage: scrub.sh [options]
@@ -41,6 +57,18 @@ Options:
   --boot-dir DIR         Root dir used to resolve BLS paths (default: derived from entries dir)
   --rebuild-grub         Run grub2-mkconfig after changes
   --grub-cfg PATH        Output path for grub2-mkconfig (default: /boot/grub2/grub.cfg)
+
+Backup (runs automatically on --force/--delete):
+  --no-backup             Do not create a filesystem backup copy of entries before changes
+  --no-snapper-backup     Do not create a snapper snapshot before changes
+
+Verification / pruning (all safe by default; pruning requires --force):
+  --no-verify-snapshots   Don't verify snapper snapshot numbers
+  --no-verify-modules     Don't verify kernel modules dirs for the entry's kernel version
+  --prune-stale-snapshots Move/delete snapper entries whose snapshot number doesn't exist
+  --prune-uninstalled     Move/delete entries whose kernel modules dir is missing (requires --confirm-uninstalled)
+  --confirm-uninstalled   Required extra safety flag to actually prune uninstalled-kernel entries
+
   -h, --help             Show this help
 
 Examples:
@@ -54,6 +82,8 @@ USAGE
 log() { printf '%s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*"; }
 err() { printf 'ERROR: %s\n' "$*" >&2; }
+
+ts_now() { date +%Y%m%d-%H%M%S; }
 
 resolve_boot_path() {
   # Resolves a BLS path to a concrete path on disk.
@@ -80,6 +110,67 @@ snapshot_dir_from_entry() {
   # Extracts a Snapper snapshot dir like /.snapshots/123/snapshot (if present).
   # Returns the first match on stdout.
   grep -Eo '/\.snapshots/[0-9]+/snapshot' "$1" 2>/dev/null | head -n 1 || true
+}
+
+snapshot_num_from_entry() {
+  # Returns the snapshot number (digits only) if the entry references /.snapshots/<n>/snapshot
+  local n
+  n="$(grep -Eo '/\.snapshots/[0-9]+/snapshot' "$1" 2>/dev/null | head -n 1 | grep -Eo '[0-9]+' || true)"
+  [[ -n "$n" ]] && printf '%s\n' "$n" || true
+}
+
+kernel_version_from_linux_path() {
+  # openSUSE sdbootutil typically uses:
+  #   linux /opensuse-tumbleweed/<KVER>/linux-<hash>
+  # Return <KVER> if detectable.
+  local p="$1"
+  p="${p#/}"
+  local distro_seg="${p%%/*}"
+  local rest="${p#*/}"
+
+  # Needs at least 2 segments
+  if [[ "$rest" == "$p" ]]; then
+    return 1
+  fi
+
+  local kver="${rest%%/*}"
+  if [[ -n "$kver" && "$kver" != "$rest" ]]; then
+    printf '%s\n' "$kver"
+  else
+    return 1
+  fi
+}
+
+modules_dir_exists_for_kver() {
+  local kver="$1"
+  [[ -n "$kver" ]] || return 1
+  [[ -d "/lib/modules/$kver" || -d "/usr/lib/modules/$kver" ]]
+}
+
+load_snapper_snapshot_set() {
+  if command -v snapper >/dev/null 2>&1; then
+    SNAPPER_AVAILABLE=true
+    while IFS= read -r raw; do
+      raw="${raw//[^0-9]/}"
+      [[ -n "$raw" ]] && SNAPSHOT_NUM_SET["$raw"]=1
+    done < <(snapper --no-dbus list 2>/dev/null | awk '/^[[:space:]]*[0-9]+/ {print $1}')
+  fi
+}
+
+snapshot_exists() {
+  # True if snapshot exists either on-disk or in snapper list output.
+  local n="$1"
+  [[ -n "$n" ]] || return 1
+
+  if [[ -d "/.snapshots/$n/snapshot" ]]; then
+    return 0
+  fi
+
+  if [[ "$SNAPPER_AVAILABLE" == true && -n "${SNAPSHOT_NUM_SET[$n]+x}" ]]; then
+    return 0
+  fi
+
+  return 1
 }
 
 # Root check
@@ -122,6 +213,29 @@ while [[ $# -gt 0 ]]; do
       shift
       GRUB_CFG="${1:-}"
       ;;
+
+    --no-backup)
+      AUTO_BACKUP=false
+      ;;
+    --no-snapper-backup)
+      AUTO_SNAPPER_BACKUP=false
+      ;;
+
+    --no-verify-snapshots)
+      VERIFY_SNAPSHOTS=false
+      ;;
+    --no-verify-modules)
+      VERIFY_KERNEL_MODULES=false
+      ;;
+    --prune-stale-snapshots)
+      PRUNE_STALE_SNAPSHOTS=true
+      ;;
+    --prune-uninstalled)
+      PRUNE_UNINSTALLED_KERNELS=true
+      ;;
+    --confirm-uninstalled)
+      CONFIRM_PRUNE_UNINSTALLED=true
+      ;;
     -h|--help)
       usage
       exit 0
@@ -159,32 +273,97 @@ if [[ ! -d "$BOOT_DIR" ]]; then
   warn "Boot root dir not found: $BOOT_DIR (path checks may be wrong)"
 fi
 
+if [[ "$VERIFY_SNAPSHOTS" == true ]]; then
+  load_snapper_snapshot_set
+fi
+
 log "========================================"
 log " Checking for Ghost BLS Entries"
 log " Entries: $ENTRIES_DIR"
 log " Boot dir: $BOOT_DIR"
 log " Mode: $( [[ "$DRY_RUN" == true ]] && echo DRY-RUN || echo APPLY ) (${DELETE_MODE})"
+log " Auto backup:      $AUTO_BACKUP"
+log " Auto snapper:     $AUTO_SNAPPER_BACKUP"
+log " Verify snapshots: $VERIFY_SNAPSHOTS (snapper: $SNAPPER_AVAILABLE)"
+log " Verify modules:   $VERIFY_KERNEL_MODULES"
+log " Prune stale snaps: $PRUNE_STALE_SNAPSHOTS"
+log " Prune uninstalled: $PRUNE_UNINSTALLED_KERNELS (confirm: $CONFIRM_PRUNE_UNINSTALLED)"
 log "========================================"
 
 ok_count=0
 ghost_count=0
 protected_count=0
+stale_snapshot_count=0
+uninstalled_kernel_count=0
 moved_or_deleted_count=0
 skipped_count=0
 
 ensure_backup_dir() {
-  if [[ "$DELETE_MODE" == "delete" ]]; then
-    return 0
-  fi
-
   if [[ -z "$BACKUP_DIR" ]]; then
     local ts
-    ts="$(date +%Y%m%d-%H%M%S)"
-    BACKUP_DIR="$ENTRIES_DIR/.scrub-ghost-backup-$ts"
+    ts="$(ts_now)"
+
+    # Prefer a backup path OUTSIDE the entries dir so we never touch it by accident.
+    # Fall back to inside ENTRIES_DIR if /var/backups isn't writable for some reason.
+    if mkdir -p -- "/var/backups/scrub-ghost" 2>/dev/null; then
+      BACKUP_DIR="/var/backups/scrub-ghost/bls-entries-$ts"
+    else
+      BACKUP_DIR="$ENTRIES_DIR/.scrub-ghost-backup-$ts"
+    fi
   fi
 
   mkdir -p -- "$BACKUP_DIR"
 }
+
+backup_entries_tree() {
+  # Makes a full copy of the current BLS entry files before any modifications.
+  # This is independent from the "move ghosts into backup" behavior.
+  ensure_backup_dir
+
+  local full_dir="$BACKUP_DIR/full"
+  mkdir -p -- "$full_dir"
+
+  # Copy only top-level .conf entries (we never recurse), preserving metadata where possible.
+  # cp -a on vfat won't preserve everything but it's still a good safety net.
+  if compgen -G "$ENTRIES_DIR/*.conf" >/dev/null; then
+    cp -a -- "$ENTRIES_DIR"/*.conf "$full_dir/" 2>/dev/null || cp -p -- "$ENTRIES_DIR"/*.conf "$full_dir/"
+  fi
+
+  {
+    echo "timestamp=$(date -Is)"
+    echo "entries_dir=$ENTRIES_DIR"
+    echo "boot_dir=$BOOT_DIR"
+    echo "delete_mode=$DELETE_MODE"
+  } >"$BACKUP_DIR/manifest.txt" || true
+}
+
+snapper_backup_snapshot() {
+  # Best-effort snapper snapshot: may not include ESP contents, but provides system rollback.
+  # We do not fail the script if snapper isn't configured.
+  if command -v snapper >/dev/null 2>&1; then
+    local desc
+    desc="scrub-ghost: pre-clean $(date -Is)"
+    SNAPPER_BACKUP_ID="$(snapper --no-dbus create --type single --cleanup-algorithm number --description "$desc" 2>/dev/null | tr -dc '0-9' || true)"
+    if [[ -n "$SNAPPER_BACKUP_ID" ]]; then
+      log "Snapper backup created: #$SNAPPER_BACKUP_ID"
+    else
+      warn "Snapper backup requested but could not create snapshot (snapper may be unconfigured)"
+    fi
+  else
+    warn "Snapper backup requested but snapper not installed"
+  fi
+}
+
+# If applying changes, create backups BEFORE touching entries.
+if [[ "$DRY_RUN" == false ]]; then
+  if [[ "$AUTO_SNAPPER_BACKUP" == true ]]; then
+    snapper_backup_snapshot
+  fi
+  if [[ "$AUTO_BACKUP" == true ]]; then
+    backup_entries_tree
+    log "Entry backup saved to: $BACKUP_DIR"
+  fi
+fi
 
 for entry in "$ENTRIES_DIR"/*.conf; do
   [[ -e "$entry" ]] || continue
@@ -212,14 +391,82 @@ for entry in "$ENTRIES_DIR"/*.conf; do
     continue
   fi
 
-  # Snapshot protection: if the entry references a snapshot and it exists, never touch it.
-  snap_dir="$(snapshot_dir_from_entry "$entry")"
+  # Snapshot verification/protection.
+  snap_num="$(snapshot_num_from_entry "$entry")"
   snap_present=false
-  if [[ -n "$snap_dir" && -d "$snap_dir" ]]; then
-    snap_present=true
+  if [[ "$VERIFY_SNAPSHOTS" == true && -n "$snap_num" ]]; then
+    if snapshot_exists "$snap_num"; then
+      snap_present=true
+    else
+      snap_present=false
+    fi
+  elif [[ -n "$snap_num" ]]; then
+    # Without snapper verification, fall back to simple on-disk check.
+    if [[ -d "/.snapshots/$snap_num/snapshot" ]]; then
+      snap_present=true
+    fi
   fi
 
-  if [[ -e "$kernel_full" ]]; then
+  # Kernel modules verification (helps detect entries for kernels not installed anymore)
+  kver=""
+  modules_present=true
+  if [[ "$VERIFY_KERNEL_MODULES" == true ]]; then
+    kver="$(kernel_version_from_linux_path "$kernel_path" 2>/dev/null || true)"
+    if [[ -n "$kver" ]]; then
+      if ! modules_dir_exists_for_kver "$kver"; then
+        modules_present=false
+      fi
+    fi
+  fi
+
+  # Kernel image missing -> ghost.
+  if [[ ! -e "$kernel_full" ]]; then
+    :
+  else
+    # Kernel image exists, but we may still want to flag stale snapper/uninstalled kernels.
+    if [[ -n "$snap_num" && "$VERIFY_SNAPSHOTS" == true && "$snap_present" == false ]]; then
+      stale_snapshot_count=$((stale_snapshot_count + 1))
+      log "[STALE-SNAPSHOT] $(basename -- "$entry") (snapshot #$snap_num not present)"
+
+      if [[ "$DRY_RUN" == true || "$PRUNE_STALE_SNAPSHOTS" == false ]]; then
+        continue
+      fi
+
+      # Apply pruning (move/delete) for stale snapshot entries
+      log "        action:  pruning stale snapshot entry"
+      if [[ "$DELETE_MODE" == "delete" ]]; then
+        rm -f -- "$entry"
+      else
+        ensure_backup_dir
+        mv -- "$entry" "$BACKUP_DIR/"
+      fi
+      moved_or_deleted_count=$((moved_or_deleted_count + 1))
+      continue
+    fi
+
+    if [[ "$modules_present" == false ]]; then
+      uninstalled_kernel_count=$((uninstalled_kernel_count + 1))
+      log "[UNINSTALLED-KERNEL] $(basename -- "$entry") (modules missing for ${kver:-unknown})"
+
+      if [[ "$PRUNE_UNINSTALLED_KERNELS" == true && "$CONFIRM_PRUNE_UNINSTALLED" == false ]]; then
+        log "        note:    pruning requires --confirm-uninstalled (extra safety flag)"
+      fi
+
+      if [[ "$DRY_RUN" == true || "$PRUNE_UNINSTALLED_KERNELS" == false || "$CONFIRM_PRUNE_UNINSTALLED" == false ]]; then
+        continue
+      fi
+
+      log "        action:  pruning uninstalled-kernel entry"
+      if [[ "$DELETE_MODE" == "delete" ]]; then
+        rm -f -- "$entry"
+      else
+        ensure_backup_dir
+        mv -- "$entry" "$BACKUP_DIR/"
+      fi
+      moved_or_deleted_count=$((moved_or_deleted_count + 1))
+      continue
+    fi
+
     log "[OK]   $(basename -- "$entry")"
     ok_count=$((ok_count + 1))
     continue
@@ -234,7 +481,11 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   log "        lookup:  $kernel_full"
 
   if [[ "$snap_present" == true ]]; then
-    log "        note:    references existing snapshot ($snap_dir)"
+    if [[ -n "$snap_num" ]]; then
+      log "        note:    references existing snapshot (#$snap_num)"
+    else
+      log "        note:    references existing snapshot"
+    fi
     log "        action:  SKIP (protected snapshot entry)"
     protected_count=$((protected_count + 1))
     continue
@@ -268,10 +519,15 @@ log " Summary"
 log "   OK entries:           $ok_count"
 log "   Ghost entries:        $ghost_count"
 log "   Protected snapshots:  $protected_count"
+log "   Stale snapshots:      $stale_snapshot_count"
+log "   Uninstalled kernels:  $uninstalled_kernel_count"
 log "   Skipped (malformed):  $skipped_count"
 if [[ "$DRY_RUN" == false ]]; then
   log "   Changed:              $moved_or_deleted_count"
-  if [[ "$DELETE_MODE" != "delete" && -n "$BACKUP_DIR" ]]; then
+  if [[ -n "$SNAPPER_BACKUP_ID" ]]; then
+    log "   Snapper backup:       #$SNAPPER_BACKUP_ID"
+  fi
+  if [[ -n "$BACKUP_DIR" ]]; then
     log "   Backup dir:           $BACKUP_DIR"
   fi
 else
@@ -279,8 +535,12 @@ else
   log ""
   log "To apply safely (move ghosts to backup):"
   log "  sudo bash $0 --force"
-  log "To permanently delete ghosts:"
-  log "  sudo bash $0 --delete"
+  log "To prune stale snapper entries too:"
+  log "  sudo bash $0 --force --prune-stale-snapshots"
+  log "To prune uninstalled-kernel entries too (extra safety confirm required):"
+  log "  sudo bash $0 --force --prune-uninstalled --confirm-uninstalled"
+  log "To permanently delete ghosts (and optionally pruned entries):"
+  log "  sudo bash $0 --delete [--prune-stale-snapshots] [--prune-uninstalled --confirm-uninstalled]"
 fi
 log "========================================"
 
