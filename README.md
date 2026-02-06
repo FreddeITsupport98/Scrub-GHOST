@@ -102,6 +102,10 @@ For automation, prefer the CLI.
 Scan:
 - `sudo ./scrub.sh --dry-run`
 
+Generate shell completion (no root required):
+- `./scrub.sh --completion zsh`
+- `./scrub.sh --completion bash`
+
 Clean safely (move to backup):
 - `sudo ./scrub.sh --force`
 
@@ -113,6 +117,10 @@ Prune entries for kernels not installed anymore (requires confirmation):
 
 Hard delete (dangerous):
 - `sudo ./scrub.sh --delete [--prune-stale-snapshots] [--prune-uninstalled --confirm-uninstalled]`
+
+Optional: rebuild/update bootloader metadata after changes:
+- `--rebuild-grub` (runs `grub2-mkconfig`)
+- `--update-sdboot` (runs `sdbootutil update-kernels`)
 
 Backups:
 - `sudo ./scrub.sh --list-backups`
@@ -202,5 +210,7 @@ Remove hook:
 - `sudo ./zypp/install-zypp-hook.sh --uninstall`
 
 ## Notes
+- Ghost/broken entry detection checks not only the `linux` path but also `initrd` (if present) and `devicetree` (if present). If any referenced file is missing, the entry is flagged as a ghost/broken entry.
+- On read-only systems (MicroOS/Aeon), when applying changes the tool will try a temporary remount `rw` for the mountpoints containing the entries directory and backup root, then restore `ro` on exit. Disable this behavior with `--no-remount-rw`.
 - `git` is not required to run the tool.
 - You should treat `--delete`, `--clean-restore`, and `--restore-anyway` as danger flags.

@@ -6,8 +6,6 @@
 # - Avoids false positives when the entry already uses /boot/… paths
 # - Protects Snapper snapshot entries when the snapshot subvolume exists
 
-set -euo pipefail
-IFS=$'\n\t'
 
 ENTRIES_DIR=""
 ENTRIES_DIR_SET=false
@@ -863,6 +861,9 @@ preflight_backup_space_or_die() {
 }
 
 main() {
+  set -euo pipefail
+  IFS=$'\n\t'
+
   # Allow --help/--completion without requiring root.
   local args=("$@")
   local i
