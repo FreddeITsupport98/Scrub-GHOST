@@ -26,12 +26,20 @@ GRUB_CFG="/boot/grub2/grub.cfg"
 # Backup root (never inside ENTRIES_DIR by default)
 BACKUP_ROOT="/var/backups/scrub-ghost"
 
+# Backup rotation
+KEEP_BACKUPS=5
+
 # Mode
 ACTION="scan"  # scan | list-backups | restore | validate
 RESTORE_FROM=""
 RESTORE_PICK=""        # 1 = newest, 2 = second newest, etc.
 RESTORE_ANYWAY=false
 RESTORE_BEST=false
+CLEAN_RESTORE=false
+
+# Safety guardrails
+RUNNING_KERNEL_VER=""
+LATEST_INSTALLED_VER=""
 
 # Output
 COLOR=true
@@ -77,6 +85,7 @@ Options:
   --delete               Permanently delete ghost entries (implies --force)
   --backup-dir DIR       Backup directory to move pruned entries into (default: auto)
   --backup-root DIR      Root directory used for automatic backups (default: /var/backups/scrub-ghost)
+  --keep-backups N        Keep last N backups under backup root (default: 5; 0 disables rotation)
   --entries-dir DIR      BLS entries directory (default: auto-detect)
   --boot-dir DIR         Root dir used to resolve BLS paths (default: derived from entries dir)
   --rebuild-grub         Run grub2-mkconfig after changes
@@ -95,6 +104,7 @@ Easy restore:
   --restore-pick N       Restore from backup number N shown by --list-backups (validated)
   --restore-best         Restore from the newest backup that passes validation
   --restore-from DIR     Restore BLS entries from a specific backup directory (validated)
+  --clean-restore        When restoring, delete extra current entries not present in the backup (dangerous)
   --restore-anyway       Override failed validation (dangerous)
 
 Validation only (no changes):
@@ -210,6 +220,68 @@ debug() {
 
 ts_now() { date +%Y%m%d-%H%M%S; }
 
+# Robust BLS parsing helpers (ignore comments/blank lines)
+bls_get_path() {
+  # $1 = key regex, $2 = file
+  local key_re="$1"
+  local file="$2"
+  awk -v re="$key_re" '
+    /^[[:space:]]*#/ {next}
+    NF < 2 {next}
+    $1 ~ re {print $2; exit}
+  ' "$file" 2>/dev/null || true
+}
+
+bls_linux_path() { bls_get_path '^linux(efi)?$' "$1"; }
+bls_initrd_path() { bls_get_path '^initrd$' "$1"; }
+
+# Kernel guardrails
+compute_kernel_guardrails() {
+  RUNNING_KERNEL_VER="$(uname -r 2>/dev/null || true)"
+
+  # Prefer modules list (more reliable on sd-boot setups than vmlinuz-* in /boot)
+  LATEST_INSTALLED_VER="$(
+    {
+      ls -1 /lib/modules 2>/dev/null || true
+      ls -1 /usr/lib/modules 2>/dev/null || true
+    } | awk 'NF{print}' | sort -uV | tail -n 1
+  )"
+
+  debug "Running kernel: ${RUNNING_KERNEL_VER:-unknown}"
+  debug "Latest installed kernel: ${LATEST_INSTALLED_VER:-unknown}"
+}
+
+rotate_backups() {
+  # Remove old backup directories to avoid filling BACKUP_ROOT.
+  [[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] || return 0
+  [[ "$KEEP_BACKUPS" -gt 0 ]] || return 0
+
+  local dirs
+  mapfile -t dirs < <(ls -1dt "$BACKUP_ROOT"/bls-entries-* 2>/dev/null || true)
+
+  local total="${#dirs[@]}"
+  if [[ "$total" -le "$KEEP_BACKUPS" ]]; then
+    return 0
+  fi
+
+  local i
+  for (( i=KEEP_BACKUPS; i<total; i++ )); do
+    local d="${dirs[$i]}"
+    [[ -n "$d" ]] || continue
+
+    # Safety: only remove expected paths
+    case "$d" in
+      "$BACKUP_ROOT"/bls-entries-*)
+        debug "Rotating backups: removing $d"
+        rm -rf -- "$d" 2>/dev/null || true
+        ;;
+      *)
+        warn "Rotate backups: refusing to remove unexpected path: $d"
+        ;;
+    esac
+  done
+}
+
 latest_backup_dir() {
   # Prefer explicit latest symlink; otherwise pick newest matching directory.
   if [[ -d "$BACKUP_ROOT/latest" ]]; then
@@ -271,7 +343,7 @@ list_backups() {
         status_color="$C_RED"
       fi
     else
-      if validate_backup_bootability "$d" >/dev/null 2>&1; then
+      if VALIDATE_QUIET=true validate_backup_bootability "$d" >/dev/null 2>&1; then
         status_tag="[OK]"
         status_color="$C_GREEN"
       else
@@ -300,7 +372,7 @@ validate_backup_structure() {
   local bad=0
   for f in "$src"/full/*.conf; do
     local kp
-    kp="$(awk '$1 ~ /^linux(efi)?$/ {print $2; exit}' "$f" 2>/dev/null || true)"
+    kp="$(bls_linux_path "$f")"
     if [[ -z "$kp" ]]; then
       bad=$((bad + 1))
     fi
@@ -317,8 +389,12 @@ validate_backup_bootability() {
   # - snapper snapshots referenced still exist (if verification enabled)
   # - machine-id match if manifest provides it
   local src="$1"
+  local quiet="${VALIDATE_QUIET:-false}"
 
   if ! validate_backup_structure "$src"; then
+    if [[ "$quiet" == true ]]; then
+      return 1
+    fi
     err "validate: backup structure invalid: $src"
     return 1
   fi
@@ -334,6 +410,9 @@ validate_backup_bootability() {
   fi
 
   if [[ -n "$manifest_mid" && -n "$this_mid" && "$manifest_mid" != "$this_mid" ]]; then
+    if [[ "$quiet" == true ]]; then
+      return 1
+    fi
     err "validate: machine-id mismatch (backup is from a different install)"
     err "validate: this=$this_mid backup=$manifest_mid"
     return 1
@@ -345,7 +424,7 @@ validate_backup_bootability() {
 
   for f in "$src"/full/*.conf; do
     local kp
-    kp="$(awk '$1 ~ /^linux(efi)?$/ {print $2; exit}' "$f" 2>/dev/null || true)"
+    kp="$(bls_linux_path "$f")"
     local kfull
     kfull="$(resolve_boot_path "$kp" || true)"
     if [[ -z "$kfull" || ! -e "$kfull" ]]; then
@@ -353,7 +432,7 @@ validate_backup_bootability() {
     fi
 
     local ip
-    ip="$(awk '$1=="initrd" {print $2; exit}' "$f" 2>/dev/null || true)"
+    ip="$(bls_initrd_path "$f")"
     if [[ -n "$ip" ]]; then
       local ifull
       ifull="$(resolve_boot_path "$ip" || true)"
@@ -374,6 +453,9 @@ validate_backup_bootability() {
   done
 
   if [[ "$missing_kernel" -ne 0 || "$missing_initrd" -ne 0 || "$missing_snapshot" -ne 0 ]]; then
+    if [[ "$quiet" == true ]]; then
+      return 1
+    fi
     err "validate: failed: missing kernel=$missing_kernel initrd=$missing_initrd snapshots=$missing_snapshot"
     return 1
   fi
@@ -432,9 +514,9 @@ restore_entries_from_backup() {
     cp -a -- "$ENTRIES_DIR"/*.conf "$pre_dir/" 2>/dev/null || cp -p -- "$ENTRIES_DIR"/*.conf "$pre_dir/"
   fi
 
-  # Safer restore strategy:
-  # 1) Copy all files from backup over (overwrite/replace)
-  # 2) Remove any extra .conf files not present in the backup set
+  # Restore strategy:
+  # - Default: additive (copy/overwrite from backup, but DO NOT remove newer entries)
+  # - Optional: --clean-restore removes any extra .conf files not present in backup
   declare -A wanted
   local bf
   for bf in "$src"/full/*.conf; do
@@ -444,15 +526,17 @@ restore_entries_from_backup() {
     cp -a -- "$bf" "$ENTRIES_DIR/$base" 2>/dev/null || cp -p -- "$bf" "$ENTRIES_DIR/$base"
   done
 
-  local cur
-  for cur in "$ENTRIES_DIR"/*.conf; do
-    [[ -e "$cur" ]] || continue
-    local base
-    base="$(basename -- "$cur")"
-    if [[ -z "${wanted[$base]+x}" ]]; then
-      rm -f -- "$cur"
-    fi
-  done
+  if [[ "$CLEAN_RESTORE" == true ]]; then
+    local cur
+    for cur in "$ENTRIES_DIR"/*.conf; do
+      [[ -e "$cur" ]] || continue
+      local base
+      base="$(basename -- "$cur")"
+      if [[ -z "${wanted[$base]+x}" ]]; then
+        rm -f -- "$cur"
+      fi
+    done
+  fi
 
   log "Restore complete."
   log "- Restored from: $src"
@@ -596,6 +680,10 @@ while [[ $# -gt 0 ]]; do
       shift
       BACKUP_ROOT="${1:-}"
       ;;
+    --keep-backups)
+      shift
+      KEEP_BACKUPS="${1:-}"
+      ;;
     --entries-dir)
       shift
       ENTRIES_DIR="${1:-}"
@@ -634,6 +722,9 @@ while [[ $# -gt 0 ]]; do
       ACTION="restore"
       shift
       RESTORE_FROM="${1:-}"
+      ;;
+    --clean-restore)
+      CLEAN_RESTORE=true
       ;;
     --restore-anyway)
       RESTORE_ANYWAY=true
@@ -720,6 +811,15 @@ if [[ -n "$LOG_FILE" ]]; then
   debug "Logging to: $LOG_FILE"
 fi
 
+# Validate keep-backups value
+if ! [[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]]; then
+  warn "Invalid --keep-backups value: '$KEEP_BACKUPS' (using 5)"
+  KEEP_BACKUPS=5
+fi
+
+# Compute kernel safety guardrails (running/latest)
+compute_kernel_guardrails
+
 if [[ "$VERIFY_SNAPSHOTS" == true ]]; then
   load_snapper_snapshot_set
 fi
@@ -749,6 +849,7 @@ build_common_flags() {
 
   # Keep using same backup root if user changed it
   [[ -n "$BACKUP_ROOT" ]] && COMMON_FLAGS+=("--backup-root" "$BACKUP_ROOT")
+  [[ -n "$KEEP_BACKUPS" ]] && COMMON_FLAGS+=("--keep-backups" "$KEEP_BACKUPS")
 
   # Preserve manual directory overrides if used
   [[ "$ENTRIES_DIR_SET" == true ]] && COMMON_FLAGS+=("--entries-dir" "$ENTRIES_DIR")
@@ -926,7 +1027,8 @@ menu_settings() {
     log "5) Toggle verify modules   (currently: $VERIFY_KERNEL_MODULES)"
     log "6) Toggle auto backup      (currently: $AUTO_BACKUP)"
     log "7) Toggle auto snapper     (currently: $AUTO_SNAPPER_BACKUP)"
-    log "8) Back"
+    log "8) Set keep backups (currently: $KEEP_BACKUPS)"
+    log "9) Back"
 
     local choice
     read -r -p "> " choice </dev/tty || return 0
@@ -939,7 +1041,16 @@ menu_settings() {
       5) VERIFY_KERNEL_MODULES=$([[ "$VERIFY_KERNEL_MODULES" == true ]] && echo false || echo true) ;;
       6) AUTO_BACKUP=$([[ "$AUTO_BACKUP" == true ]] && echo false || echo true) ;;
       7) AUTO_SNAPPER_BACKUP=$([[ "$AUTO_SNAPPER_BACKUP" == true ]] && echo false || echo true) ;;
-      8) return 0 ;;
+      8)
+        local n
+        read -r -p "Keep how many backups? (0 disables rotation): " n </dev/tty || true
+        if [[ "$n" =~ ^[0-9]+$ ]]; then
+          KEEP_BACKUPS="$n"
+        else
+          log "Invalid number."
+        fi
+        ;;
+      9) return 0 ;;
       *) log "Invalid option." ;;
     esac
 
@@ -1021,6 +1132,8 @@ log "========================================"
 ok_count=0
 ghost_count=0
 protected_count=0
+protected_kernel_count=0
+critical_kernel_count=0
 stale_snapshot_count=0
 uninstalled_kernel_count=0
 moved_or_deleted_count=0
@@ -1074,6 +1187,9 @@ backup_entries_tree() {
       echo "snapper_backup_id=$SNAPPER_BACKUP_ID"
     fi
   } >"$BACKUP_DIR/manifest.txt" || true
+
+  # Rotate old backups after creating a new one
+  rotate_backups
 }
 
 snapper_backup_snapshot() {
@@ -1114,14 +1230,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   [[ -e "$entry" ]] || continue
 
   # Pull first linux/linuxefi path.
-  kernel_path="$(
-    awk '
-      $1 ~ /^linux(efi)?$/ {
-        print $2;
-        exit
-      }
-    ' "$entry" 2>/dev/null || true
-  )"
+  kernel_path="$(bls_linux_path "$entry")"
 
   if [[ -z "$kernel_path" ]]; then
     warn "Skipping (no linux/linuxefi line): $(basename -- "$entry")"
@@ -1134,6 +1243,17 @@ for entry in "$ENTRIES_DIR"/*.conf; do
     warn "Skipping (could not resolve kernel path): $(basename -- "$entry")"
     skipped_count=$((skipped_count + 1))
     continue
+  fi
+
+  # Determine kernel version from entry (used for safety guardrails)
+  entry_kver="$(kernel_version_from_linux_path "$kernel_path" 2>/dev/null || true)"
+  is_running_kernel=false
+  is_latest_kernel=false
+  if [[ -n "$entry_kver" && -n "$RUNNING_KERNEL_VER" && "$entry_kver" == "$RUNNING_KERNEL_VER" ]]; then
+    is_running_kernel=true
+  fi
+  if [[ -n "$entry_kver" && -n "$LATEST_INSTALLED_VER" && "$entry_kver" == "$LATEST_INSTALLED_VER" ]]; then
+    is_latest_kernel=true
   fi
 
   # Snapshot verification/protection.
@@ -1177,6 +1297,12 @@ for entry in "$ENTRIES_DIR"/*.conf; do
         continue
       fi
 
+      if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true ]]; then
+        log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel: ${entry_kver:-unknown})"
+        protected_kernel_count=$((protected_kernel_count + 1))
+        continue
+      fi
+
       # Apply pruning (move/delete) for stale snapshot entries
       log "        action:  pruning stale snapshot entry"
       if [[ "$DELETE_MODE" == "delete" ]]; then
@@ -1201,6 +1327,12 @@ for entry in "$ENTRIES_DIR"/*.conf; do
         continue
       fi
 
+      if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true ]]; then
+        log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel: ${entry_kver:-unknown})"
+        protected_kernel_count=$((protected_kernel_count + 1))
+        continue
+      fi
+
       log "        action:  pruning uninstalled-kernel entry"
       if [[ "$DELETE_MODE" == "delete" ]]; then
         rm -f -- "$entry"
@@ -1221,7 +1353,15 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   ghost_count=$((ghost_count + 1))
 
   log ""
-  log "${C_RED}[GHOST]${C_RESET} $(basename -- "$entry")"
+  if [[ "$is_running_kernel" == true ]]; then
+    log "${C_RED}[CRITICAL-GHOST]${C_RESET} $(basename -- "$entry") ${C_DIM}(running kernel: ${entry_kver:-unknown})${C_RESET}"
+    critical_kernel_count=$((critical_kernel_count + 1))
+  elif [[ "$is_latest_kernel" == true ]]; then
+    log "${C_YELLOW}[WARN-GHOST]${C_RESET} $(basename -- "$entry") ${C_DIM}(latest installed kernel: ${entry_kver:-unknown})${C_RESET}"
+    protected_kernel_count=$((protected_kernel_count + 1))
+  else
+    log "${C_RED}[GHOST]${C_RESET} $(basename -- "$entry")"
+  fi
   log "        linux:   $kernel_path"
   log "        lookup:  $kernel_full"
 
@@ -1237,11 +1377,21 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   fi
 
   if [[ "$DRY_RUN" == true ]]; then
-    if [[ "$DELETE_MODE" == "delete" ]]; then
-      log "        action:  (dry-run) would DELETE"
+    if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true ]]; then
+      log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel: ${entry_kver:-unknown})"
     else
-      log "        action:  (dry-run) would MOVE to backup"
+      if [[ "$DELETE_MODE" == "delete" ]]; then
+        log "        action:  (dry-run) would DELETE"
+      else
+        log "        action:  (dry-run) would MOVE to backup"
+      fi
     fi
+    continue
+  fi
+
+  if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true ]]; then
+    log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel: ${entry_kver:-unknown})"
+    protected_kernel_count=$((protected_kernel_count + 1))
     continue
   fi
 
@@ -1264,6 +1414,8 @@ log " Summary"
 log "   OK entries:           $ok_count"
 log "   Ghost entries:        $ghost_count"
 log "   Protected snapshots:  $protected_count"
+log "   Protected kernels:    $protected_kernel_count"
+log "   Critical kernels:     $critical_kernel_count"
 log "   Stale snapshots:      $stale_snapshot_count"
 log "   Uninstalled kernels:  $uninstalled_kernel_count"
 log "   Skipped (malformed):  $skipped_count"
