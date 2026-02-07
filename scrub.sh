@@ -773,20 +773,19 @@ restore_entries_from_backup() {
 
   # Restore strategy:
   # - Default: additive (copy/overwrite from backup, but DO NOT remove newer entries)
-  # - Optional: --clean-restore removes any extra .conf files not present in backup
+  # - Optional: --clean-restore removes extra entries not present in backup (defensively)
   declare -A wanted
   local bf
   for bf in "$src"/full/*.conf; do
     local base
     base="$(basename -- "$bf")"
     wanted["$base"]=1
-    cp -a -- "$bf" "$ENTRIES_DIR/$base" 2>/dev/null || cp -p -- "$bf" "$ENTRIES_DIR/$base"
   done
 
+  # Clean-restore preview (always show what would be deleted; require explicit confirmation).
+  declare -a clean_remove
+  clean_remove=()
   if [[ "$CLEAN_RESTORE" == true ]]; then
-    # Safer clean-restore:
-    # - Only remove extra entries that look broken (missing kernel),
-    #   and never remove entries that appear to be for the running kernel.
     local cur
     for cur in "$ENTRIES_DIR"/*.conf; do
       [[ -e "$cur" ]] || continue
@@ -798,18 +797,52 @@ restore_entries_from_backup() {
         kfull="$(resolve_boot_path "$kp" 2>/dev/null || true)"
 
         if [[ -n "$RUNNING_KERNEL_VER" ]] && path_mentions_kver "$kp" "$RUNNING_KERNEL_VER"; then
-          warn "clean-restore: keeping extra entry (mentions running kernel): $base"
+          [[ "$VERBOSE" == true ]] && warn "clean-restore preview: KEEP (mentions running kernel): $base"
           continue
         fi
-
         if [[ -n "$kfull" && -s "$kfull" ]]; then
-          warn "clean-restore: keeping extra entry (kernel exists): $base"
+          [[ "$VERBOSE" == true ]] && warn "clean-restore preview: KEEP (kernel exists): $base"
           continue
         fi
 
-        warn "clean-restore: removing extra broken entry: $base"
-        rm -f -- "$cur"
+        clean_remove+=("$cur")
       fi
+    done
+
+    if (( ${#clean_remove[@]} > 0 )); then
+      log ""
+      warn "clean-restore preview: ${#clean_remove[@]} extra entry file(s) would be removed:" 
+      local f
+      for f in "${clean_remove[@]}"; do
+        warn "  REMOVE: $(basename -- "$f")"
+      done
+      log ""
+      log "Type YES to proceed with restore + clean-restore deletions:" 
+      local yn
+      read -r -p "> " yn </dev/tty || true
+      if [[ "$yn" != "YES" ]]; then
+        err "Cancelled restore (clean-restore not confirmed)."
+        exit 1
+      fi
+    else
+      [[ "$VERBOSE" == true ]] && log "clean-restore preview: no extra broken entries to remove."
+    fi
+  fi
+
+  # Copy/overwrite from backup
+  for bf in "$src"/full/*.conf; do
+    local base
+    base="$(basename -- "$bf")"
+    cp -a -- "$bf" "$ENTRIES_DIR/$base" 2>/dev/null || cp -p -- "$bf" "$ENTRIES_DIR/$base"
+  done
+
+  # Apply clean-restore deletions (defensive: remove only entries that looked broken in the preview)
+  if [[ "$CLEAN_RESTORE" == true && ${#clean_remove[@]} -gt 0 ]]; then
+    local f
+    for f in "${clean_remove[@]}"; do
+      [[ -e "$f" ]] || continue
+      warn "clean-restore: removing extra broken entry: $(basename -- "$f")"
+      rm -f -- "$f"
     done
   fi
 
@@ -2197,7 +2230,7 @@ menu_restore() {
     log "2) Restore best (newest passing validation)"
     log "3) Restore pick number"
     log "4) Restore from path"
-    log "5) Toggle clean restore (delete extras)"
+    log "5) Toggle clean restore (delete extras; shows preview + requires YES on restore)"
     log "6) Toggle restore anyway (dangerous)"
     log "7) Back"
 
@@ -2227,7 +2260,14 @@ menu_restore() {
         prompt_enter_to_continue
         ;;
       5)
-        CLEAN_RESTORE=$([[ "$CLEAN_RESTORE" == true ]] && echo false || echo true)
+        if [[ "$CLEAN_RESTORE" == false ]]; then
+          log "Type YES to enable clean restore (will delete extra broken entries not present in the backup):"
+          local yn
+          read -r -p "> " yn </dev/tty || true
+          [[ "$yn" == "YES" ]] && CLEAN_RESTORE=true
+        else
+          CLEAN_RESTORE=false
+        fi
         ;;
       6)
         if [[ "$RESTORE_ANYWAY" == false ]]; then

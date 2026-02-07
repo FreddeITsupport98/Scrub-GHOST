@@ -242,4 +242,4 @@ Remove hook:
 - On read-only systems (MicroOS/Aeon), when applying changes the tool will try a temporary remount `rw` for the mountpoints containing the entries directory and backup root, then restore `ro` on exit. Disable this behavior with `--no-remount-rw`.
 - On MicroOS/Aeon, `/usr/local` may be read-only; use a transactional environment (e.g. `transactional-update shell`) for installs/integrations.
 - `git` is not required to run the tool.
-- You should treat `--delete`, `--clean-restore`, and `--restore-anyway` as danger flags. `--clean-restore` is implemented defensively (it avoids deleting extra entries that still have a valid kernel present), but it can still surprise you if you expect additive behavior.
+- You should treat `--delete`, `--clean-restore`, and `--restore-anyway` as danger flags. `--clean-restore` is implemented defensively (it avoids deleting extra entries that still have a valid kernel present). When enabled, restore will print a preview of which extra entries it would remove and requires you to type `YES` before it deletes anything.
