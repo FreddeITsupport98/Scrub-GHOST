@@ -44,7 +44,7 @@ Recommended for most users:
 Smart behavior highlights:
 - Shows **boot storage health** (useful when /boot or ESP is full).
 - After applying a fix, it automatically **re-scans** to verify the counts dropped.
-- Duplicate detection stores mtimes and warns when the “duplicate” entry is actually newer.
+- Duplicate detection uses a two-pass index so it keeps the “best” candidate automatically (prefers protected snapshot/kernel entries; otherwise keeps the newest mtime).
 - If a kernel image is detected as 0 bytes and it is owned by an RPM, the tool suggests a repair command (`zypper in -f <pkg>`).
 
 Safe cleanup (moves entries to a backup directory; does not hard-delete):

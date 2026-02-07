@@ -3030,8 +3030,127 @@ skipped_count=0
 
 declare -A SEEN_PAYLOADS
 
+# Duplicate resolution index (2-pass): keep the best candidate per payload.
+# "Best" is chosen by:
+#  1) protection score (snapshot-present > protected kernel > normal)
+#  2) newest mtime
+# This avoids "first file wins" behavior.
+
+declare -A DUP_BEST_FILE
+declare -A DUP_BEST_SCORE
+declare -A DUP_BEST_MTIME
+declare -A DUP_COUNT
+
 declare -a JSON_RESULTS
 JSON_RESULTS=()
+
+compute_duplicate_protection_score() {
+  # Prints a numeric score (higher = prefer keeping this entry).
+  # 2 = protected snapshot
+  # 1 = protected kernel (running/latest)
+  # 0 = normal
+  local entry_file="$1"
+  local kernel_path="$2"
+
+  local snap_num snap_present
+  snap_num="$(snapshot_num_from_entry "$entry_file")"
+  snap_present=false
+  if [[ -n "$snap_num" ]]; then
+    if [[ "$VERIFY_SNAPSHOTS" == true ]]; then
+      snapshot_exists "$snap_num" && snap_present=true || snap_present=false
+    else
+      [[ -d "/.snapshots/$snap_num/snapshot" ]] && snap_present=true
+    fi
+  fi
+
+  if [[ "$snap_present" == true ]]; then
+    printf '2\n'
+    return 0
+  fi
+
+  # Protected kernel check
+  local kver
+  kver="$(kernel_version_from_linux_path "$kernel_path" 2>/dev/null || true)"
+
+  if [[ -n "$RUNNING_KERNEL_VER" ]]; then
+    if [[ -n "$kver" && "$kver" == "$RUNNING_KERNEL_VER" ]] || path_mentions_kver "$kernel_path" "$RUNNING_KERNEL_VER"; then
+      printf '1\n'
+      return 0
+    fi
+  fi
+  if [[ -n "$LATEST_INSTALLED_VER" ]]; then
+    if [[ -n "$kver" && "$kver" == "$LATEST_INSTALLED_VER" ]] || path_mentions_kver "$kernel_path" "$LATEST_INSTALLED_VER"; then
+      printf '1\n'
+      return 0
+    fi
+  fi
+
+  printf '0\n'
+}
+
+build_duplicate_index() {
+  # Pre-scan entries to decide which duplicate to keep.
+  # This is intentionally best-effort; failures just reduce duplicate accuracy.
+  local f
+  for f in "$ENTRIES_DIR"/*.conf; do
+    [[ -e "$f" ]] || continue
+
+    local kp
+    kp="$(bls_linux_path "$f")"
+    [[ -n "$kp" ]] || continue
+
+    # Collect initrds (multi-initrd aware)
+    local initrd_join
+    initrd_join=""
+    declare -a ips
+    ips=()
+    mapfile -t ips < <(bls_initrd_paths "$f")
+    if (( ${#ips[@]} > 0 )); then
+      initrd_join="$(printf '%s ' "${ips[@]}" | sed 's/[[:space:]]*$//')"
+    fi
+
+    local opts
+    opts="$(bls_options_line "$f")"
+
+    local raw sig
+    raw="${kp}|${initrd_join}|${opts}"
+    sig="$(payload_signature "$raw")"
+    [[ -n "$sig" ]] || continue
+
+    DUP_COUNT["$sig"]=$(( ${DUP_COUNT[$sig]:-0} + 1 ))
+
+    local mtime
+    mtime="$(stat -c %Y -- "$f" 2>/dev/null || echo 0)"
+
+    local score
+    score="$(compute_duplicate_protection_score "$f" "$kp" 2>/dev/null || echo 0)"
+    [[ "$score" =~ ^[0-9]+$ ]] || score=0
+
+    if [[ -z "${DUP_BEST_FILE[$sig]+x}" ]]; then
+      DUP_BEST_FILE["$sig"]="$f"
+      DUP_BEST_SCORE["$sig"]="$score"
+      DUP_BEST_MTIME["$sig"]="$mtime"
+      continue
+    fi
+
+    local best_score best_mtime
+    best_score="${DUP_BEST_SCORE[$sig]:-0}"
+    best_mtime="${DUP_BEST_MTIME[$sig]:-0}"
+
+    # Prefer higher score; if tie, prefer newer mtime.
+    if [[ "$score" -gt "$best_score" ]]; then
+      DUP_BEST_FILE["$sig"]="$f"
+      DUP_BEST_SCORE["$sig"]="$score"
+      DUP_BEST_MTIME["$sig"]="$mtime"
+    elif [[ "$score" -eq "$best_score" ]]; then
+      if [[ "$mtime" =~ ^[0-9]+$ && "$best_mtime" =~ ^[0-9]+$ && "$mtime" -gt "$best_mtime" ]]; then
+        DUP_BEST_FILE["$sig"]="$f"
+        DUP_BEST_SCORE["$sig"]="$score"
+        DUP_BEST_MTIME["$sig"]="$mtime"
+      fi
+    fi
+  done
+}
 
 ensure_backup_dir() {
   if [[ -z "$BACKUP_DIR" ]]; then
@@ -3156,6 +3275,10 @@ move_entry_to_backup_dir() {
   mv -f -- "$tmp" "$dest"
   rm -f -- "$src"
 }
+
+# Build duplicate index (2-pass) so duplicate pruning keeps the best candidate.
+# Done after guardrails/snapper-set are available.
+build_duplicate_index
 
 # If applying changes, ensure writable mounts and create backups BEFORE touching entries.
 if [[ "$DRY_RUN" == false ]]; then
@@ -3322,26 +3445,21 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   payload_raw="${kernel_path}|${initrd_path}|${entry_options}"
   payload_sig="$(payload_signature "$payload_raw")"
 
-    local current_mtime stored_data stored_file stored_mtime
-    current_mtime="$(stat -c %Y -- "$entry" 2>/dev/null || echo 0)"
+    local best_file best_mtime best_score current_mtime
+    best_file="${DUP_BEST_FILE[$payload_sig]:-}"
 
-    if [[ -n "${SEEN_PAYLOADS[$payload_sig]+x}" ]]; then
-      stored_data="${SEEN_PAYLOADS[$payload_sig]}"
-
-      # Expected format: <fullpath>|<mtime>
-      if [[ "$stored_data" == *"|"* ]]; then
-        stored_file="${stored_data%%|*}"
-        stored_mtime="${stored_data#*|}"
-      else
-        stored_file="$stored_data"
-        stored_mtime=0
-      fi
-
+    # If this payload appears more than once, treat non-best entries as duplicates.
+    if [[ "${DUP_COUNT[$payload_sig]:-0}" -gt 1 && -n "$best_file" && "$best_file" != "$entry" ]]; then
       duplicate_found_count=$((duplicate_found_count + 1))
+
+      best_mtime="${DUP_BEST_MTIME[$payload_sig]:-0}"
+      best_score="${DUP_BEST_SCORE[$payload_sig]:-0}"
+      current_mtime="$(stat -c %Y -- "$entry" 2>/dev/null || echo 0)"
+
       log "${C_YELLOW}[DUPLICATE]${C_RESET} $(basename -- "$entry")"
-      log "        matches: $(basename -- "$stored_file")"
-      if [[ "$current_mtime" =~ ^[0-9]+$ && "$stored_mtime" =~ ^[0-9]+$ && "$current_mtime" -gt "$stored_mtime" ]]; then
-        log "        ${C_YELLOW}NOTE:${C_RESET} current entry is newer than the one we are keeping (mtime $current_mtime > $stored_mtime)"
+      log "        keep:    $(basename -- "$best_file")"
+      if [[ "$current_mtime" =~ ^[0-9]+$ && "$best_mtime" =~ ^[0-9]+$ && "$current_mtime" -gt "$best_mtime" ]]; then
+        log "        ${C_YELLOW}NOTE:${C_RESET} current is newer but losing due to protection/heuristics (best_score=$best_score)"
       fi
 
       if [[ "$PRUNE_DUPLICATES" == true ]]; then
@@ -3364,14 +3482,14 @@ for entry in "$ENTRIES_DIR"/*.conf; do
 
         log "        action:  pruning duplicate"
         if [[ "$DELETE_MODE" == "delete" ]]; then
-          log_audit "ACTION=DELETE file=$entry reason=duplicate matches=$(basename -- "$stored_file")"
+          log_audit "ACTION=DELETE file=$entry reason=duplicate keep=$(basename -- "$best_file")"
           rm -f -- "$entry"
           moved_or_deleted_count=$((moved_or_deleted_count + 1))
           duplicate_pruned_count=$((duplicate_pruned_count + 1))
           json_add_result "$(basename -- "$entry")" "DUPLICATE" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "DELETE" "duplicate"
         else
           ensure_backup_dir
-          log_audit "ACTION=MOVE file=$entry dest=$BACKUP_DIR reason=duplicate matches=$(basename -- "$stored_file")"
+          log_audit "ACTION=MOVE file=$entry dest=$BACKUP_DIR reason=duplicate keep=$(basename -- "$best_file")"
           move_entry_to_backup_dir "$entry" "$BACKUP_DIR"
           moved_or_deleted_count=$((moved_or_deleted_count + 1))
           duplicate_pruned_count=$((duplicate_pruned_count + 1))
@@ -3384,8 +3502,8 @@ for entry in "$ENTRIES_DIR"/*.conf; do
       json_add_result "$(basename -- "$entry")" "DUPLICATE" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "NONE" "duplicate"
       continue
     else
-      # Store full path + mtime for smarter duplicate warnings.
-      SEEN_PAYLOADS["$payload_sig"]="$entry|$current_mtime"
+      # Primary / chosen duplicate candidate.
+      :
     fi
 
     # Kernel image exists, but we may still want to flag stale snapper/uninstalled kernels.
