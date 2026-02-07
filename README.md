@@ -21,6 +21,14 @@ This tool defaults to **dry-run** and uses **backups**. Still:
 - Know how to restore (see "Recovery" below).
 
 ## Quick start
+Supported distros:
+- openSUSE Tumbleweed
+- openSUSE Slowroll
+- openSUSE immutable variants (e.g. MicroOS/Aeon/Kalpa)
+
+Not supported:
+- openSUSE Leap (the script will refuse to run)
+
 Dry-run scan (recommended first):
 - `sudo ./scrub.sh --dry-run`
 

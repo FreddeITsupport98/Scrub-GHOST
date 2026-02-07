@@ -328,6 +328,50 @@ debug() {
   fi
 }
 
+check_supported_os_or_die() {
+  # This tool is intentionally scoped to openSUSE (Tumbleweed/Slowroll/immutable variants).
+  # Refuse to run on openSUSE Leap to avoid untested behavior.
+  local id="" name="" variant="" version_id="" id_like=""
+
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    id="${ID:-}"
+    name="${NAME:-}"
+    variant="${VARIANT_ID:-}"
+    version_id="${VERSION_ID:-}"
+    id_like="${ID_LIKE:-}"
+  else
+    err "Unsupported OS: /etc/os-release not found"
+    exit 1
+  fi
+
+  local is_opensuse=false
+  if [[ "$id" == opensuse* ]]; then
+    is_opensuse=true
+  elif [[ "$name" == *openSUSE* ]]; then
+    is_opensuse=true
+  fi
+
+  if [[ "$is_opensuse" != true ]]; then
+    err "Unsupported OS: this tool only runs on openSUSE (detected: ID='${id:-unknown}' NAME='${name:-unknown}')"
+    exit 1
+  fi
+
+  local is_leap=false
+  if [[ "$id" == *leap* || "$variant" == *leap* || "$name" == *Leap* ]]; then
+    is_leap=true
+  fi
+
+  if [[ "$is_leap" == true ]]; then
+    err "Unsupported openSUSE variant: Leap (detected: ID='${id:-unknown}' NAME='${name:-unknown}' VERSION_ID='${version_id:-unknown}')"
+    err "This script supports openSUSE Tumbleweed/Slowroll and openSUSE immutable variants (e.g. MicroOS/Aeon/Kalpa)."
+    exit 1
+  fi
+
+  debug "OS check: ok (ID='${id:-unknown}' NAME='${name:-unknown}' VARIANT_ID='${variant:-}' VERSION_ID='${version_id:-}')"
+}
+
 log_audit() {
   # Sends critical actions to the system journal (best effort)
   local msg="$1"
@@ -1712,6 +1756,9 @@ init_logging
 if [[ -n "$LOG_FILE" ]]; then
   debug "Logging to: $LOG_FILE"
 fi
+
+# Enforce supported distro/variant.
+check_supported_os_or_die
 
 if [[ "$ACTION" == "rescue" ]]; then
   menu_rescue_wizard
