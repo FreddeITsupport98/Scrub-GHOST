@@ -1659,6 +1659,16 @@ main() {
 
   ORIG_ARGC=$#
 
+  require_arg() {
+    # $1=option name, $2=next token
+    local opt="$1"
+    local val="${2-}"
+    if [[ -z "$val" || "$val" == --* ]]; then
+      err "Option $opt requires a value. Use -h or --help."
+      exit 2
+    fi
+  }
+
 # Argument parsing
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -1678,8 +1688,9 @@ while [[ $# -gt 0 ]]; do
       DEBUG=true
       ;;
     --log-file)
+      require_arg "$1" "${2-}"
       shift
-      LOG_FILE="${1:-}"
+      LOG_FILE="$1"
       LOG_FILE_SET=true
       ;;
     --no-color)
@@ -1699,26 +1710,31 @@ while [[ $# -gt 0 ]]; do
       DELETE_MODE="delete"
       ;;
     --backup-dir)
+      require_arg "$1" "${2-}"
       shift
-      BACKUP_DIR="${1:-}"
+      BACKUP_DIR="$1"
       BACKUP_DIR_SET=true
       ;;
     --backup-root)
+      require_arg "$1" "${2-}"
       shift
-      BACKUP_ROOT="${1:-}"
+      BACKUP_ROOT="$1"
       ;;
     --keep-backups)
+      require_arg "$1" "${2-}"
       shift
-      KEEP_BACKUPS="${1:-}"
+      KEEP_BACKUPS="$1"
       ;;
     --entries-dir)
+      require_arg "$1" "${2-}"
       shift
-      ENTRIES_DIR="${1:-}"
+      ENTRIES_DIR="$1"
       ENTRIES_DIR_SET=true
       ;;
     --boot-dir)
+      require_arg "$1" "${2-}"
       shift
-      BOOT_DIR="${1:-}"
+      BOOT_DIR="$1"
       BOOT_DIR_SET=true
       ;;
     --rebuild-grub)
@@ -1738,8 +1754,9 @@ while [[ $# -gt 0 ]]; do
       fi
       ;;
     --grub-cfg)
+      require_arg "$1" "${2-}"
       shift
-      GRUB_CFG="${1:-}"
+      GRUB_CFG="$1"
       GRUB_CFG_SET=true
       ;;
 
@@ -1752,8 +1769,9 @@ while [[ $# -gt 0 ]]; do
       ;;
     --restore-pick)
       ACTION="restore"
+      require_arg "$1" "${2-}"
       shift
-      RESTORE_PICK="${1:-}"
+      RESTORE_PICK="$1"
       ;;
     --restore-best)
       ACTION="restore"
@@ -1761,8 +1779,9 @@ while [[ $# -gt 0 ]]; do
       ;;
     --restore-from)
       ACTION="restore"
+      require_arg "$1" "${2-}"
       shift
-      RESTORE_FROM="${1:-}"
+      RESTORE_FROM="$1"
       ;;
     --clean-restore)
       CLEAN_RESTORE=true
@@ -1777,13 +1796,15 @@ while [[ $# -gt 0 ]]; do
       ;;
     --validate-pick)
       ACTION="validate"
+      require_arg "$1" "${2-}"
       shift
-      RESTORE_PICK="${1:-}"
+      RESTORE_PICK="$1"
       ;;
     --validate-from)
       ACTION="validate"
+      require_arg "$1" "${2-}"
       shift
-      RESTORE_FROM="${1:-}"
+      RESTORE_FROM="$1"
       ;;
 
     --no-backup)
@@ -1816,8 +1837,7 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      err "Unknown argument: $1"
-      usage
+      err "Unknown argument: $1. Use -h or --help."
       exit 2
       ;;
   esac

@@ -259,6 +259,7 @@ Remove hook:
 - `sudo ./zypp/install-zypp-hook.sh --uninstall`
 
 ## Notes
+- **Argument validation:** unknown options (or options missing required values) will print an error and exit. Use `-h` or `--help` to see the full usage.
 - Ghost/broken entry detection checks not only the `linux` path but also `initrd` (if present) and `devicetree` (if present). If any referenced file is missing, the entry is flagged as a ghost/broken entry. If an entry has multiple `initrd` lines, **all** initrds must exist.
 - **Quoted values:** BLS allows quoted values containing spaces (e.g. `linux "/EFI/My Folder/linux.efi"`). The parser supports this for path-like keys.
 - **Corruption detection:** a kernel file that exists but is **0 bytes** is treated as broken (common when the ESP runs out of space). If the kernel file is owned by an RPM package, the tool also runs a lightweight `rpm -Vf` check and flags **checksum mismatches** as corrupt (`CORRUPT-CSUM`).
