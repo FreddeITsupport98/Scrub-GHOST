@@ -2295,6 +2295,97 @@ scan_orphaned_files() {
   fi
 }
 
+list_orphaned_files() {
+  # Prints full paths (one per line) for orphaned kernel-ish files under BOOT_DIR.
+  declare -A referenced
+
+  local f
+  for f in "$ENTRIES_DIR"/*.conf; do
+    [[ -e "$f" ]] || continue
+
+    local k
+    k="$(bls_linux_path "$f")"
+    [[ -n "$k" ]] && referenced["$(basename -- "$k")"]=1
+
+    declare -a ips
+    ips=()
+    mapfile -t ips < <(bls_initrd_paths "$f")
+    local ip
+    for ip in "${ips[@]}"; do
+      [[ -n "$ip" ]] && referenced["$(basename -- "$ip")"]=1
+    done
+
+    local dt
+    dt="$(bls_devicetree_path "$f")"
+    [[ -n "$dt" ]] && referenced["$(basename -- "$dt")"]=1
+  done
+
+  if command -v find >/dev/null 2>&1; then
+    local p
+    while IFS= read -r -d '' p; do
+      [[ -n "$p" && -f "$p" ]] || continue
+      local base
+      base="$(basename -- "$p")"
+      if [[ -z "${referenced[$base]+x}" ]]; then
+        printf '%s\n' "$p"
+      fi
+    done < <(
+      find "$BOOT_DIR" -maxdepth 4 -type f \( \
+        -name 'vmlinuz-*' -o -name 'linux-*' -o -name 'initrd-*' -o -name 'initramfs-*' \
+      \) -print0 2>/dev/null || true
+    )
+  else
+    local p
+    for p in "$BOOT_DIR"/vmlinuz-* "$BOOT_DIR"/linux-* "$BOOT_DIR"/initrd-* "$BOOT_DIR"/initramfs-*; do
+      [[ -e "$p" && -f "$p" ]] || continue
+      local base
+      base="$(basename -- "$p")"
+      if [[ -z "${referenced[$base]+x}" ]]; then
+        printf '%s\n' "$p"
+      fi
+    done
+  fi
+}
+
+quarantine_orphaned_files() {
+  # Moves orphaned kernel-ish files into a backup folder (reversible).
+  local orphan_list
+  orphan_list="$(list_orphaned_files 2>/dev/null || true)"
+  if [[ -z "$orphan_list" ]]; then
+    log "No orphaned images found."
+    return 0
+  fi
+
+  maybe_temp_remount_rw_for_path "$BOOT_DIR" "boot dir"
+
+  # Create a standard backup dir so users can restore easily.
+  if [[ "$AUTO_BACKUP" == true ]]; then
+    backup_entries_tree
+  else
+    ensure_backup_dir
+  fi
+
+  local dest_dir="$BACKUP_DIR/orphans"
+  maybe_temp_remount_rw_for_path "$dest_dir" "orphan backup dir"
+  mkdir -p -- "$dest_dir"
+
+  local moved=0
+  local p
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    if [[ -e "$p" ]]; then
+      if move_entry_to_backup_dir "$p" "$dest_dir"; then
+        moved=$((moved + 1))
+      else
+        warn "Failed to quarantine: $p"
+      fi
+    fi
+  done <<<"$orphan_list"
+
+  log "Quarantined $moved orphan image(s) to: $dest_dir"
+  log "(If needed, you can copy them back manually from that folder.)"
+}
+
 pinned_config_path() {
   printf '%s\n' "$ENTRIES_DIR/.scrub-ghost-pinned"
 }
@@ -2761,6 +2852,7 @@ menu_auto_fix() {
     PROGRESS_TOTAL="$1"
     PROGRESS_CUR=0
     PROGRESS_ACTIVE=false
+    PROGRESS_AT_EOL=false
 
     # Only show progress when stdout is a TTY.
     if [[ -t 1 ]]; then
@@ -2772,6 +2864,8 @@ menu_auto_fix() {
     # $1 = label
     local label="$1"
     [[ "${PROGRESS_ACTIVE:-false}" == true ]] || return 0
+
+    PROGRESS_AT_EOL=false
 
     PROGRESS_CUR=$((PROGRESS_CUR + 1))
     local pct=$(( PROGRESS_CUR * 100 / PROGRESS_TOTAL ))
@@ -2788,45 +2882,48 @@ menu_auto_fix() {
 
     if [[ "$PROGRESS_CUR" -ge "$PROGRESS_TOTAL" ]]; then
       printf '\n'
+      PROGRESS_AT_EOL=true
     fi
+  }
+
+  progress_finish() {
+    # Ensure we end the progress line before printing normal log lines.
+    [[ "${PROGRESS_ACTIVE:-false}" == true ]] || return 0
+    if [[ "${PROGRESS_AT_EOL:-false}" != true ]]; then
+      printf '\n'
+    fi
+    PROGRESS_ACTIVE=false
+    PROGRESS_AT_EOL=true
   }
 
   while true; do
     menu_header
     log "${C_BOLD}Smart Auto-Fix${C_RESET}"
     log "Analyzing system state..."
-    progress_init 10
-    progress_tick "Boot storage health"
 
-    # 0) Context awareness: boot storage health
+    progress_init 10
+
+    progress_tick "Boot storage health"
     local storage_status storage_rc
     storage_status="$(check_boot_storage_health)"
     storage_rc=$?
 
     progress_tick "Kernel redundancy"
-
-    # 0b) Sysadmin safety: kernel redundancy (spare tire check)
     local redundancy_status redundancy_rc
     redundancy_status="$(check_kernel_redundancy)"
     redundancy_rc=$?
 
     progress_tick "Default entry health"
-
-    # 0c) Sysadmin safety: GRUB default entry health (saved_entry)
     local def_health def_health_rc
     def_health="$(check_default_entry_health)"
     def_health_rc=$?
 
     progress_tick "GRUB config freshness"
-
-    # 0d) Bootloader drift detection (grub.cfg freshness)
     local grub_status grub_rc
     grub_status="$(check_grub_freshness)"
     grub_rc=$?
 
     progress_tick "Dry-run JSON scan"
-
-    # 1) Silent dry-run analysis in JSON mode (no jq dependency)
     build_common_flags_minimal
     local json_output
     json_output="$(SCRUB_GHOST_NO_MENU=1 bash "$SCRIPT_SELF" --no-menu \
@@ -2835,14 +2932,43 @@ menu_auto_fix() {
       "${COMMON_FLAGS[@]}" --log-file /dev/null 2>/dev/null || true)"
 
     progress_tick "Parse counts"
-
-    # 2) Parse summary integers
     local n_ghost n_zombie n_stale n_dupe n_uninstall
     n_ghost="$(json_summary_int "$json_output" ghost)"
     n_zombie="$(json_summary_int "$json_output" zombie_initrd)"
     n_stale="$(json_summary_int "$json_output" stale_snapshot)"
     n_dupe="$(json_summary_int "$json_output" duplicate_found)"
     n_uninstall="$(json_summary_int "$json_output" uninstalled_kernel)"
+
+    progress_tick "Scan orphaned images"
+    local orphans orphan_count
+    orphans="$(scan_orphaned_files 2>/dev/null || printf 'None\n')"
+    orphan_count=0
+    if [[ "$orphans" != "None" ]]; then
+      orphan_count="$(printf '%s' "$orphans" | awk '{print $1}' | tr -dc '0-9' || echo 0)"
+      [[ "$orphan_count" =~ ^[0-9]+$ ]] || orphan_count=0
+    fi
+
+    progress_tick "Detect repairable zombies"
+    local repair_suggestions
+    repair_suggestions="$(scan_repairable_entries 2>/dev/null || true)"
+
+    progress_tick "Scan corrupt kernel RPMs"
+    local corrupt_pkg_list corrupt_pkg_count
+    corrupt_pkg_list="$(scan_corrupt_kernel_packages 2>/dev/null || true)"
+    corrupt_pkg_count=0
+    if [[ -n "$corrupt_pkg_list" ]]; then
+      corrupt_pkg_count="$(printf '%s\n' "$corrupt_pkg_list" | wc -l | tr -dc '0-9' || echo 0)"
+    fi
+
+    progress_tick "Scan excess kernels"
+    local excess_list excess_count
+    excess_list="$(scan_excess_kernels 2>/dev/null || true)"
+    excess_count=0
+    if [[ -n "$excess_list" ]]; then
+      excess_count="$(printf '%s\n' "$excess_list" | wc -l | tr -dc '0-9' || echo 0)"
+    fi
+
+    progress_finish
 
     log ""
     log "${C_BOLD}Analysis Results & Recommendations:${C_RESET}"
@@ -2853,11 +2979,6 @@ menu_auto_fix() {
     log " 0. GRUB Config:         $grub_status"
     log " 1. Ghost Entries:       $(recommend_action \"$n_ghost\" ghost)"
     log " 1b. Zombie Initrd:      $(recommend_action "$n_zombie" zombie)"
-    progress_tick "Scan orphaned images"
-
-    local orphans
-    orphans="$(scan_orphaned_files 2>/dev/null || printf 'None\n')"
-
     log " 2. Duplicate Entries:   $(recommend_action "$n_dupe" duplicate)"
     log " 3. Stale Snapshots:     $(recommend_action "$n_stale" stale)"
     log " 4. Uninstalled Kernels: $(recommend_action "$n_uninstall" uninstalled)"
@@ -2877,16 +2998,13 @@ menu_auto_fix() {
     if [[ "$storage_rc" -eq 2 && "$n_uninstall" -gt 0 ]]; then
       warn "Boot storage is CRITICAL; consider option 'K' to prune uninstalled-kernel entries (aggressive)."
     fi
-    if [[ "$orphans" != "None" ]]; then
-      log "${C_DIM}Tip: Orphaned images are files in BOOT_DIR with no menu entry.${C_RESET}"
-      log "${C_DIM}     To reclaim space, consider: ${C_BOLD}sudo zypper purge-kernels${C_RESET}${C_DIM} (review first).${C_RESET}"
+
+    if [[ "$orphan_count" -gt 0 ]]; then
+      log "${C_DIM}Tip: Orphaned images are files in BOOT_DIR with no current BLS entry.${C_RESET}"
+      log "${C_DIM}     Use ${C_BOLD}ORPHANS${C_RESET}${C_DIM} to quarantine them (move to backup; reversible).${C_RESET}"
+      log "${C_DIM}     Or use ${C_BOLD}VACUUM${C_RESET}${C_DIM} to remove old kernel packages (often cleans them up too).${C_RESET}"
     fi
 
-    progress_tick "Detect repairable zombies"
-
-    # Mechanic advisor: propose repairs for entries with valid kernel but missing/corrupt initrd.
-    local repair_suggestions
-    repair_suggestions="$(scan_repairable_entries 2>/dev/null || true)"
     if [[ -n "$repair_suggestions" ]]; then
       log ""
       log "${C_YELLOW}SMART REPAIR:${C_RESET} Found valid kernels with missing/corrupt initrds."
@@ -2897,31 +3015,12 @@ menu_auto_fix() {
       done <<<"$repair_suggestions"
     fi
 
-    progress_tick "Scan corrupt kernel RPMs"
-
-    # Active healer: find RPM packages that own corrupt kernel images.
-    local corrupt_pkg_list corrupt_pkg_count
-    corrupt_pkg_list="$(scan_corrupt_kernel_packages 2>/dev/null || true)"
-    corrupt_pkg_count=0
-    if [[ -n "$corrupt_pkg_list" ]]; then
-      corrupt_pkg_count="$(printf '%s\n' "$corrupt_pkg_list" | wc -l | tr -dc '0-9' || echo 0)"
-    fi
-
-    progress_tick "Scan excess kernels"
-
-    # Vacuum advisor: identify excess (old but valid) kernel packages.
-    local excess_list excess_count
-    excess_list="$(scan_excess_kernels 2>/dev/null || true)"
-    excess_count=0
-    if [[ -n "$excess_list" ]]; then
-      excess_count="$(printf '%s\n' "$excess_list" | wc -l | tr -dc '0-9' || echo 0)"
-    fi
-
     local total_safe total_issues
     total_safe=$((n_ghost + n_dupe))
     total_issues=$((n_ghost + n_dupe + n_zombie + n_stale + n_uninstall))
 
-    if [[ "$total_issues" -eq 0 ]]; then
+    # Treat the system as "clean" only if there are no actionable recommendations.
+    if [[ "$total_issues" -eq 0 && "$excess_count" -eq 0 && "$corrupt_pkg_count" -eq 0 && -z "$repair_suggestions" && "$orphan_count" -eq 0 && "$def_health_rc" -ne 2 && "$grub_rc" -ne 1 ]]; then
       log "${C_GREEN}System is clean! No actions needed.${C_RESET}"
       prompt_enter_to_continue
       return 0
@@ -2943,6 +3042,9 @@ menu_auto_fix() {
     fi
     if [[ "$excess_count" -gt 0 ]]; then
       log "  ${C_BOLD}VACUUM${C_RESET})  Free disk space (remove $excess_count old kernel packages)"
+    fi
+    if [[ "$orphan_count" -gt 0 ]]; then
+      log "  ${C_BOLD}ORPHANS${C_RESET}) Quarantine orphaned images (move to backup; reversible)"
     fi
     if [[ "$total_safe" -gt 0 ]]; then
       log "  ${C_BOLD}FIX${C_RESET})  Apply SAFE fixes only (Ghosts + Duplicates)"
@@ -3100,6 +3202,69 @@ menu_auto_fix() {
         log "${C_GREEN}Repairs complete.${C_RESET} Re-scanning..."
         sleep 1
         continue
+        ;;
+
+      ORPHANS|orphans|O|o)
+        if [[ "$orphan_count" -le 0 ]]; then
+          log "No orphaned images detected."
+          prompt_enter_to_continue
+          continue
+        fi
+
+        local orphan_list
+        orphan_list="$(list_orphaned_files 2>/dev/null || true)"
+        if [[ -z "$orphan_list" ]]; then
+          log "No orphaned images detected."
+          prompt_enter_to_continue
+          continue
+        fi
+
+        log "${C_BOLD}Orphaned Images (preview)${C_RESET}"
+        log "These files are in BOOT_DIR but are not referenced by any current BLS entry:"
+
+        local shown=0
+        local total_bytes=0
+        local p
+        while IFS= read -r p; do
+          [[ -n "$p" ]] || continue
+          local sz
+          sz="$(stat -c %s -- "$p" 2>/dev/null || echo 0)"
+          [[ "$sz" =~ ^[0-9]+$ ]] || sz=0
+          total_bytes=$((total_bytes + sz))
+
+          if [[ "$shown" -lt 50 ]]; then
+            shown=$((shown + 1))
+            local mb=$(( sz / 1024 / 1024 ))
+            log "  ${C_DIM}$p${C_RESET} (${mb}MB)"
+          fi
+        done <<<"$orphan_list"
+
+        if [[ "$orphan_count" -gt 50 ]]; then
+          log "  ${C_DIM}... and $((orphan_count - 50)) more${C_RESET}"
+        fi
+
+        local total_mb=$(( total_bytes / 1024 / 1024 ))
+        log ""
+        log "Total (estimated): $orphan_count file(s) (~${total_mb}MB)"
+        log ""
+        log "This will MOVE the files into a backup folder under:"
+        log "  $BACKUP_ROOT"
+        log "(Reversible: you can copy them back if needed.)"
+        log ""
+        log "Type ORPHANS to proceed, or anything else to cancel:"
+        local yn
+        read -r -p "> " yn </dev/tty || true
+        if [[ "$yn" == "ORPHANS" ]]; then
+          quarantine_orphaned_files
+          log ""
+          log "Re-scanning..."
+          sleep 1
+          continue
+        else
+          log "Cancelled."
+        fi
+
+        prompt_enter_to_continue
         ;;
 
       VACUUM|vacuum)

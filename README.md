@@ -50,6 +50,7 @@ Smart behavior highlights:
 - Checks **GRUB default entry health** (saved_entry) and can fix a broken saved default by setting it to the latest detected kernel entry.
 - Checks **bootloader drift**: if `grub.cfg` is older than the newest BLS entry, it will show `STALE` and offers an `UPDATE` action (runs `grub2-mkconfig`).
 - Shows an **orphaned images** estimate (kernel/initrd files in `BOOT_DIR` that are not referenced by any current BLS entry).
+- If orphaned images are detected, Smart Auto-Fix offers an **ORPHANS** action to **quarantine** them (move into the backup folder; reversible).
 - Offers **Smart Repair** suggestions when it finds entries where the kernel exists but the initrd is missing/corrupt (suggested `dracut --force --kver ...`). These are reported as `ZOMBIE-INITRD` and are **not removed by default**. Smart Auto-Fix also offers a `REPAIR` action to run the required `dracut` commands for you.
 - Offers an **Active Healer** option to reinstall RPM-owned corrupt kernel packages (runs `zypper in -f ...` after confirmation).
 - Offers a **Vacuum advisor** to identify excess installed kernel packages (not running, not latest) and optionally remove them via `zypper rm ...`. Vacuum respects pinning (pinned kernels are never suggested for removal).
