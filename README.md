@@ -233,13 +233,13 @@ Remove hook:
 - `sudo ./zypp/install-zypp-hook.sh --uninstall`
 
 ## Notes
-- Ghost/broken entry detection checks not only the `linux` path but also `initrd` (if present) and `devicetree` (if present). If any referenced file is missing, the entry is flagged as a ghost/broken entry.
+- Ghost/broken entry detection checks not only the `linux` path but also `initrd` (if present) and `devicetree` (if present). If any referenced file is missing, the entry is flagged as a ghost/broken entry. If an entry has multiple `initrd` lines, **all** initrds must exist.
 - **Corruption detection:** a kernel file that exists but is **0 bytes** is treated as broken (common when the ESP runs out of space).
 - **Auditing:** when the tool moves/deletes entries, it also writes best-effort audit lines to the system journal via `logger` (tag: `scrub-ghost`).
 - **Kernel version parsing:** the tool understands both sd-boot style paths (`/distro/<kver>/...`) and flat BLS/GRUB-style paths (`/vmlinuz-<kver>`). If it cannot confidently determine a kernel version, it will avoid classifying entries as `UNINSTALLED-KERNEL` (too risky) and will report that the modules check was skipped.
-- **Mountpoints with spaces:** the /proc-based mount fallback decodes the `\040`-style escaping used in `/proc/mounts` so read-only detection works even when mountpoints contain spaces.
+- **Mountpoints with spaces:** mount detection decodes the `\040`-style escaping used in `/proc/mounts`, and mountpoint/options parsing uses a non-space delimiter so remount logic works even when mountpoints contain spaces.
 - **Backup moves across filesystems:** when entries are moved to a backup directory on a different filesystem, the tool uses an explicit copy+verify+delete flow (instead of relying on non-atomic cross-device `mv`).
 - On read-only systems (MicroOS/Aeon), when applying changes the tool will try a temporary remount `rw` for the mountpoints containing the entries directory and backup root, then restore `ro` on exit. Disable this behavior with `--no-remount-rw`.
 - On MicroOS/Aeon, `/usr/local` may be read-only; use a transactional environment (e.g. `transactional-update shell`) for installs/integrations.
 - `git` is not required to run the tool.
-- You should treat `--delete`, `--clean-restore`, and `--restore-anyway` as danger flags.
+- You should treat `--delete`, `--clean-restore`, and `--restore-anyway` as danger flags. `--clean-restore` is implemented defensively (it avoids deleting extra entries that still have a valid kernel present), but it can still surprise you if you expect additive behavior.

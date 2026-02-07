@@ -398,16 +398,17 @@ ts_now() { date +%Y%m%d-%H%M%S; }
 
 # Robust BLS parsing helpers (ignore comments/blank lines)
 bls_get_path() {
-  # $1 = key regex, $2 = file
+  # $1 = key regex (lowercase), $2 = file
   local key_re="$1"
   local file="$2"
 
   # Note: we only read the first value field (BLS paths normally contain no spaces).
   # Strip simple quoting ("/path" or '/path').
+  # BLS keys are case-insensitive, so we compare using tolower($1).
   awk -v re="$key_re" '
     /^[[:space:]]*#/ {next}
     NF < 2 {next}
-    $1 ~ re {
+    tolower($1) ~ re {
       v=$2
       gsub(/^"|"$/, "", v)
       gsub(/^\x27|\x27$/, "", v)
@@ -417,14 +418,32 @@ bls_get_path() {
   ' "$file" 2>/dev/null || true
 }
 
+bls_get_all_paths() {
+  # $1 = key regex (lowercase), $2 = file
+  # Prints all values for repeated BLS keys (e.g. multiple initrd lines).
+  local key_re="$1"
+  local file="$2"
+
+  awk -v re="$key_re" '
+    /^[[:space:]]*#/ {next}
+    NF < 2 {next}
+    tolower($1) ~ re {
+      v=$2
+      gsub(/^"|"$/, "", v)
+      gsub(/^\x27|\x27$/, "", v)
+      print v
+    }
+  ' "$file" 2>/dev/null || true
+}
+
 bls_get_rest_of_line() {
-  # $1 = key regex, $2 = file
+  # $1 = key regex (lowercase), $2 = file
   # Prints everything after the key token (used for "options" lines).
   local key_re="$1"
   local file="$2"
   awk -v re="$key_re" '
     /^[[:space:]]*#/ {next}
-    $1 ~ re {
+    tolower($1) ~ re {
       $1=""
       sub(/^[[:space:]]+/, "")
       print
@@ -435,6 +454,7 @@ bls_get_rest_of_line() {
 
 bls_linux_path() { bls_get_path '^linux(efi)?$' "$1"; }
 bls_initrd_path() { bls_get_path '^initrd$' "$1"; }
+bls_initrd_paths() { bls_get_all_paths '^initrd$' "$1"; }
 bls_devicetree_path() { bls_get_path '^devicetree$' "$1"; }
 bls_options_line() { bls_get_rest_of_line '^options$' "$1"; }
 
@@ -454,12 +474,24 @@ compute_kernel_guardrails() {
   RUNNING_KERNEL_VER="$(uname -r 2>/dev/null || true)"
 
   # Prefer modules list (more reliable on sd-boot setups than vmlinuz-* in /boot)
-  LATEST_INSTALLED_VER="$(
-    {
-      ls -1 /lib/modules 2>/dev/null || true
-      ls -1 /usr/lib/modules 2>/dev/null || true
-    } | awk 'NF{print}' | sort -uV | tail -n 1
-  )"
+  # Portability: sort -V is a GNU extension; in minimal/rescue environments it may not exist.
+  local have_sort_v=false
+  if printf '1\n2\n' | sort -V >/dev/null 2>&1; then
+    have_sort_v=true
+  fi
+
+  if [[ "$have_sort_v" == true ]]; then
+    LATEST_INSTALLED_VER="$(
+      {
+        ls -1 /lib/modules 2>/dev/null || true
+        ls -1 /usr/lib/modules 2>/dev/null || true
+      } | awk 'NF{print}' | sort -uV | tail -n 1
+    )"
+  else
+    # Safer to have no "latest" protection than a wrong one.
+    LATEST_INSTALLED_VER=""
+    debug "sort -V not available; skipping latest-installed-kernel detection"
+  fi
 
   debug "Running kernel: ${RUNNING_KERNEL_VER:-unknown}"
   debug "Latest installed kernel: ${LATEST_INSTALLED_VER:-unknown}"
@@ -752,12 +784,30 @@ restore_entries_from_backup() {
   done
 
   if [[ "$CLEAN_RESTORE" == true ]]; then
+    # Safer clean-restore:
+    # - Only remove extra entries that look broken (missing kernel),
+    #   and never remove entries that appear to be for the running kernel.
     local cur
     for cur in "$ENTRIES_DIR"/*.conf; do
       [[ -e "$cur" ]] || continue
       local base
       base="$(basename -- "$cur")"
       if [[ -z "${wanted[$base]+x}" ]]; then
+        local kp kfull
+        kp="$(bls_linux_path "$cur")"
+        kfull="$(resolve_boot_path "$kp" 2>/dev/null || true)"
+
+        if [[ -n "$RUNNING_KERNEL_VER" ]] && path_mentions_kver "$kp" "$RUNNING_KERNEL_VER"; then
+          warn "clean-restore: keeping extra entry (mentions running kernel): $base"
+          continue
+        fi
+
+        if [[ -n "$kfull" && -s "$kfull" ]]; then
+          warn "clean-restore: keeping extra entry (kernel exists): $base"
+          continue
+        fi
+
+        warn "clean-restore: removing extra broken entry: $base"
         rm -f -- "$cur"
       fi
     done
@@ -894,16 +944,29 @@ declare -A REMOUNT_WAS_RO
 REMOUNTED_MOUNTPOINTS=()
 
 mount_info_for_path() {
-  # Prints: "<mountpoint> <options>" or nothing.
+  # Prints: "<mountpoint>|<options>" or nothing.
   local p="$1"
 
   if command -v findmnt >/dev/null 2>&1; then
-    local mp opts
-    mp="$(findmnt -no TARGET -T "$p" 2>/dev/null | head -n 1 || true)"
-    opts="$(findmnt -no OPTIONS -T "$p" 2>/dev/null | head -n 1 || true)"
-    if [[ -n "$mp" ]]; then
-      printf '%s %s\n' "$mp" "$opts"
+    # Use an explicit delimiter so mountpoints containing spaces are unambiguous.
+    # util-linux findmnt supports --output-separator.
+    local out
+    out="$(findmnt -no TARGET,OPTIONS --output-separator '|' -T "$p" 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$out" && "$out" == *"|"* ]]; then
+      printf '%s\n' "$out"
       return 0
+    fi
+
+    # Fallback if --output-separator isn't supported: use -P (key="value") format.
+    out="$(findmnt -Pno TARGET,OPTIONS -T "$p" 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$out" ]]; then
+      local mp opts
+      mp="$(printf '%s\n' "$out" | sed -n 's/.*TARGET="\([^"]*\)".*/\1/p')"
+      opts="$(printf '%s\n' "$out" | sed -n 's/.*OPTIONS="\([^"]*\)".*/\1/p')"
+      if [[ -n "$mp" ]]; then
+        printf '%s|%s\n' "$mp" "$opts"
+        return 0
+      fi
     fi
   fi
 
@@ -927,7 +990,7 @@ mount_info_for_path() {
   done </proc/mounts
 
   if [[ -n "$best_mp" ]]; then
-    printf '%s %s\n' "$best_mp" "$best_opts"
+    printf '%s|%s\n' "$best_mp" "$best_opts"
     return 0
   fi
 
@@ -959,8 +1022,16 @@ maybe_temp_remount_rw_for_path() {
 
   local info mp opts
   info="$(mount_info_for_path "$p" 2>/dev/null || true)"
-  mp="${info%% *}"
-  opts="${info#* }"
+
+  # Expected format: <mountpoint>|<options>
+  if [[ "$info" == *"|"* ]]; then
+    mp="${info%%|*}"
+    opts="${info#*|}"
+  else
+    # Backward/unknown format fallback (best effort)
+    mp="${info%% *}"
+    opts="${info#* }"
+  fi
 
   [[ -n "$mp" ]] || return 0
 
@@ -2587,14 +2658,29 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   fi
 
   # initrd/devicetree checks (if referenced)
-  initrd_path="$(bls_initrd_path "$entry")"
+  # BLS allows multiple initrd lines; ALL must exist for the entry to be bootable.
+  initrd_path=""
   initrd_full=""
   missing_initrd=false
-  if [[ -n "$initrd_path" ]]; then
-    initrd_full="$(resolve_boot_path "$initrd_path" || true)"
-    if [[ -z "$initrd_full" || ! -s "$initrd_full" ]]; then
-      missing_initrd=true
-    fi
+  declare -a initrds
+  initrds=()
+  mapfile -t initrds < <(bls_initrd_paths "$entry")
+
+  if (( ${#initrds[@]} > 0 )); then
+    # Keep a joined representation for logging/JSON/duplicate detection.
+    initrd_path="$(printf '%s ' "${initrds[@]}" | sed 's/[[:space:]]*$//')"
+
+    local ip
+    for ip in "${initrds[@]}"; do
+      [[ -n "$ip" ]] || continue
+      initrd_full="$(resolve_boot_path "$ip" || true)"
+      if [[ -z "$initrd_full" || ! -s "$initrd_full" ]]; then
+        missing_initrd=true
+        if [[ "$VERBOSE" == true ]]; then
+          log "        missing initrd: $ip"
+        fi
+      fi
+    done
   fi
 
   devicetree_path="$(bls_devicetree_path "$entry")"
@@ -2619,12 +2705,12 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   # If nothing is missing, entry is potentially OK (then check duplicates / stale snapshot / uninstalled-kernel).
   if [[ "$missing_kernel" == false && "$missing_initrd" == false && "$missing_devicetree" == false ]]; then
 
-    # Duplicate detection/pruning: hash the functional payload (linux+initrd+options).
-    # Snapshot entries are treated as protected when the snapshot exists.
-    local entry_options payload_raw payload_sig
-    entry_options="$(bls_options_line "$entry")"
-    payload_raw="${kernel_path}|${initrd_path}|${entry_options}"
-    payload_sig="$(payload_signature "$payload_raw")"
+  # Duplicate detection/pruning: hash the functional payload (linux+initrd(s)+options).
+  # Snapshot entries are treated as protected when the snapshot exists.
+  local entry_options payload_raw payload_sig
+  entry_options="$(bls_options_line "$entry")"
+  payload_raw="${kernel_path}|${initrd_path}|${entry_options}"
+  payload_sig="$(payload_signature "$payload_raw")"
 
     if [[ -n "${SEEN_PAYLOADS[$payload_sig]+x}" ]]; then
       duplicate_found_count=$((duplicate_found_count + 1))
