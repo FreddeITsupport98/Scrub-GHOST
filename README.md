@@ -234,6 +234,7 @@ Remove hook:
 
 ## Notes
 - Ghost/broken entry detection checks not only the `linux` path but also `initrd` (if present) and `devicetree` (if present). If any referenced file is missing, the entry is flagged as a ghost/broken entry. If an entry has multiple `initrd` lines, **all** initrds must exist.
+- **Quoted values:** BLS allows quoted values containing spaces (e.g. `linux "/EFI/My Folder/linux.efi"`). The parser supports this for path-like keys.
 - **Corruption detection:** a kernel file that exists but is **0 bytes** is treated as broken (common when the ESP runs out of space).
 - **Auditing:** when the tool moves/deletes entries, it also writes best-effort audit lines to the system journal via `logger` (tag: `scrub-ghost`).
 - **Kernel version parsing:** the tool understands both sd-boot style paths (`/distro/<kver>/...`) and flat BLS/GRUB-style paths (`/vmlinuz-<kver>`). If it cannot confidently determine a kernel version, it will avoid classifying entries as `UNINSTALLED-KERNEL` (too risky) and will report that the modules check was skipped.

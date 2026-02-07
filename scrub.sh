@@ -356,6 +356,9 @@ json_escape() {
   fi
 
   # Fallback: common escapes only.
+  # Also strip other ASCII control chars (best effort) so JSON stays parseable.
+  # (Bash strings cannot contain NUL bytes anyway.)
+  s=$(printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037' 2>/dev/null || printf '%s' "$s")
   s=${s//\\/\\\\}
   s=${s//"/\\"}
   s=${s//$'\n'/\\n}
@@ -407,17 +410,33 @@ bls_get_path() {
   local key_re="$1"
   local file="$2"
 
-  # Note: we only read the first value field (BLS paths normally contain no spaces).
-  # Strip simple quoting ("/path" or '/path').
-  # BLS keys are case-insensitive, so we compare using tolower($1).
+  # BLS keys are case-insensitive; values may be quoted and may contain spaces.
+  # If quoted, we extract the first quoted string. If unquoted, we take the first token.
   awk -v re="$key_re" '
     /^[[:space:]]*#/ {next}
     NF < 2 {next}
     tolower($1) ~ re {
-      v=$2
-      gsub(/^"|"$/, "", v)
-      gsub(/^\x27|\x27$/, "", v)
-      print v
+      $1=""
+      val=$0
+      sub(/^[[:space:]]+/, "", val)
+
+      if (val ~ /^"/) {
+        # Double-quoted value (may contain spaces)
+        if (match(val, /^"[^"]*"/)) {
+          val = substr(val, RSTART+1, RLENGTH-2)
+        }
+      } else if (val ~ /^\x27/) {
+        # Single-quoted value (treat similarly)
+        if (match(val, /^\x27[^\x27]*\x27/)) {
+          val = substr(val, RSTART+1, RLENGTH-2)
+        }
+      } else {
+        # Unquoted: take first whitespace-delimited token
+        split(val, tokens, /[[:space:]]+/)
+        val = tokens[1]
+      }
+
+      print val
       exit
     }
   ' "$file" 2>/dev/null || true
@@ -433,10 +452,24 @@ bls_get_all_paths() {
     /^[[:space:]]*#/ {next}
     NF < 2 {next}
     tolower($1) ~ re {
-      v=$2
-      gsub(/^"|"$/, "", v)
-      gsub(/^\x27|\x27$/, "", v)
-      print v
+      $1=""
+      val=$0
+      sub(/^[[:space:]]+/, "", val)
+
+      if (val ~ /^"/) {
+        if (match(val, /^"[^"]*"/)) {
+          val = substr(val, RSTART+1, RLENGTH-2)
+        }
+      } else if (val ~ /^\x27/) {
+        if (match(val, /^\x27[^\x27]*\x27/)) {
+          val = substr(val, RSTART+1, RLENGTH-2)
+        }
+      } else {
+        split(val, tokens, /[[:space:]]+/)
+        val = tokens[1]
+      }
+
+      print val
     }
   ' "$file" 2>/dev/null || true
 }
