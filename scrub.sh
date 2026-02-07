@@ -241,6 +241,15 @@ log_to_file() {
   # Best effort: write to LOG_FILE without ANSI codes.
   [[ -n "$LOG_FILE" ]] || return 0
 
+  # Avoid noisy "Permission denied" errors before init_logging() picks a writable path.
+  local dir
+  dir="$(dirname -- "$LOG_FILE")"
+  if [[ -e "$LOG_FILE" ]]; then
+    [[ -w "$LOG_FILE" ]] || return 0
+  else
+    [[ -w "$dir" ]] || return 0
+  fi
+
   # Strip ANSI escapes before writing to file.
   # Prefer sed -E for portability (BSD/macOS); fall back to sed -r (GNU).
   local line
@@ -1651,12 +1660,6 @@ main() {
     esac
   done
 
-  # Root check
-  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-    err "Please run as root (sudo)."
-    return 1
-  fi
-
   ORIG_ARGC=$#
 
   require_arg() {
@@ -1844,6 +1847,12 @@ while [[ $# -gt 0 ]]; do
   shift
 
 done
+
+  # Root check (after parsing so typos fail fast with a helpful message).
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    err "Please run as root (sudo). Use -h or --help."
+    return 1
+  fi
 
 # Initialize colors/logging once we parsed flags.
 # (Rescue mode needs this before checking for BLS entries.)
