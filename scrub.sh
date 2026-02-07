@@ -2482,6 +2482,81 @@ rpm_file_digest_mismatch() {
   return 1
 }
 
+# --- FINAL POLISH START ---
+
+detect_transactional_update() {
+  # True when transactional-update exists AND / is mounted read-only.
+  # This is how MicroOS/Aeon/Kalpa behave in normal operation.
+  command -v transactional-update >/dev/null 2>&1 || return 1
+
+  local info opts
+  info="$(mount_info_for_path "/" 2>/dev/null || true)"
+  opts=""
+  if [[ "$info" == *"|"* ]]; then
+    opts="${info#*|}"
+  fi
+
+  [[ -n "$opts" ]] || return 1
+  mount_opts_have_ro "$opts"
+}
+
+run_pkg_manager() {
+  # $1 = action: install|remove
+  # remaining args = package names (or NEVRAs)
+  local action="$1"
+  shift || true
+
+  declare -a pkgs
+  pkgs=("$@")
+
+  if (( ${#pkgs[@]} == 0 )); then
+    err "run_pkg_manager: no packages provided"
+    return 1
+  fi
+
+  if detect_transactional_update; then
+    log "${C_YELLOW}Immutable System Detected:${C_RESET} Using transactional-update (reboot required)."
+    log "Running: transactional-update pkg $action ${pkgs[*]}"
+
+    if transactional-update pkg "$action" "${pkgs[@]}"; then
+      log ""
+      log "${C_GREEN}Success!${C_RESET} Changes will apply after the next reboot."
+      log "${C_DIM}(The script cannot re-scan these changes until you reboot.)${C_RESET}"
+      return 2
+    else
+      err "transactional-update failed."
+      return 1
+    fi
+  fi
+
+  if ! command -v zypper >/dev/null 2>&1; then
+    err "zypper not found."
+    return 1
+  fi
+
+  local z_cmd
+  z_cmd="in"
+  if [[ "$action" == "remove" ]]; then
+    z_cmd="rm"
+  fi
+
+  declare -a flags
+  flags=(-n)
+  if [[ "$action" == "install" ]]; then
+    flags+=(-f)
+  fi
+
+  log "Running: zypper ${flags[*]} $z_cmd ${pkgs[*]}"
+  if zypper "${flags[@]}" "$z_cmd" "${pkgs[@]}"; then
+    return 0
+  else
+    err "zypper failed."
+    return 1
+  fi
+}
+
+# --- FINAL POLISH END ---
+
 scan_corrupt_kernel_packages() {
   # Prints unique RPM package *names* that own kernel images which look corrupt.
   # Corrupt = 0 bytes OR rpm digest mismatch.
@@ -2822,11 +2897,6 @@ menu_auto_fix() {
           prompt_enter_to_continue
           continue
         fi
-        if ! command -v zypper >/dev/null 2>&1; then
-          err "zypper not found; cannot run active repair."
-          prompt_enter_to_continue
-          continue
-        fi
 
         log "${C_BOLD}Active Repair${C_RESET}"
         log "About to reinstall packages:"
@@ -2842,11 +2912,19 @@ menu_auto_fix() {
           declare -a pkgs
           pkgs=()
           mapfile -t pkgs < <(printf '%s\n' "$corrupt_pkg_list" | awk 'NF{print}' | sort -u)
+
           if (( ${#pkgs[@]} > 0 )); then
-            zypper -n in -f "${pkgs[@]}" || true
-            log "Reinstall complete. Re-scanning..."
-            sleep 1
-            continue
+            run_pkg_manager "install" "${pkgs[@]}"
+            local rc=$?
+
+            if [[ "$rc" -eq 0 ]]; then
+              log "Reinstall complete. Re-scanning..."
+              sleep 1
+              continue
+            elif [[ "$rc" -eq 2 ]]; then
+              prompt_enter_to_continue
+              continue
+            fi
           fi
         else
           log "Cancelled."
@@ -2897,11 +2975,6 @@ menu_auto_fix() {
           prompt_enter_to_continue
           continue
         fi
-        if ! command -v zypper >/dev/null 2>&1; then
-          err "zypper not found; cannot run vacuum."
-          prompt_enter_to_continue
-          continue
-        fi
 
         log "${C_BOLD}Vacuum Advisor${C_RESET}"
         log "The following kernel packages look removable (not running, not latest):"
@@ -2918,11 +2991,19 @@ menu_auto_fix() {
           declare -a pkgs
           pkgs=()
           mapfile -t pkgs < <(printf '%s\n' "$excess_list" | awk 'NF{print}' | sort -u)
+
           if (( ${#pkgs[@]} > 0 )); then
-            zypper -n rm "${pkgs[@]}" || true
-            log "Vacuum complete. Re-scanning..."
-            sleep 1
-            continue
+            run_pkg_manager "remove" "${pkgs[@]}"
+            local rc=$?
+
+            if [[ "$rc" -eq 0 ]]; then
+              log "Vacuum complete. Re-scanning..."
+              sleep 1
+              continue
+            elif [[ "$rc" -eq 2 ]]; then
+              prompt_enter_to_continue
+              continue
+            fi
           fi
         else
           log "Cancelled."
