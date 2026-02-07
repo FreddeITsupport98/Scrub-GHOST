@@ -2036,6 +2036,8 @@ build_common_flags_minimal() {
   [[ "$BOOT_DIR_SET" == true ]] && COMMON_FLAGS+=("--boot-dir" "$BOOT_DIR")
 }
 
+LAST_SUBCOMMAND_RC=0
+
 run_sub() {
   build_common_flags
 
@@ -2046,11 +2048,15 @@ run_sub() {
   rc=$?
   set -e
 
+  LAST_SUBCOMMAND_RC=$rc
+
   if [[ "$rc" -ne 0 ]]; then
     err "Subcommand failed (exit=$rc). Run with --debug or check the log file for details."
+    # IMPORTANT: do not propagate failure to the menu caller (set -e would terminate the menu).
+    return 0
   fi
 
-  return $rc
+  return 0
 }
 
 run_sub_minimal() {
@@ -2063,11 +2069,14 @@ run_sub_minimal() {
   rc=$?
   set -e
 
+  LAST_SUBCOMMAND_RC=$rc
+
   if [[ "$rc" -ne 0 ]]; then
     err "Subcommand failed (exit=$rc). Run with --debug or check the log file for details."
+    return 0
   fi
 
-  return $rc
+  return 0
 }
 
 # --- SMART IMPROVEMENTS START ---
