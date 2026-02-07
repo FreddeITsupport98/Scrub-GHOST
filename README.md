@@ -45,7 +45,7 @@ Smart behavior highlights:
 - Shows **boot storage health** (useful when /boot or ESP is full).
 - Shows **boot redundancy** (how many unique kernel versions have at least one bootable BLS entry). If you only have 1, Smart Auto-Fix will require an extra confirmation.
 - Shows an **orphaned images** estimate (kernel/initrd files in `BOOT_DIR` that are not referenced by any current BLS entry).
-- Offers **Smart Repair** suggestions when it finds entries where the kernel exists but the initrd is missing/corrupt (suggested `dracut --force --kver ...`).
+- Offers **Smart Repair** suggestions when it finds entries where the kernel exists but the initrd is missing/corrupt (suggested `dracut --force --kver ...`). These are reported as `ZOMBIE-INITRD` and are **not removed by default**.
 - After applying a fix, it automatically **re-scans** to verify the counts dropped.
 - Duplicate detection uses a two-pass index so it keeps the “best” candidate automatically (prefers protected snapshot/kernel/default entries; otherwise keeps the newest mtime).
 - If a kernel image is detected as corrupt (0 bytes **or** RPM checksum mismatch) and it is owned by an RPM, the tool suggests a repair command (`zypper in -f <pkg>`).
@@ -144,6 +144,9 @@ Prune entries for kernels not installed anymore (requires confirmation):
 
 Prune duplicate entries (same linux+initrd+options payload):
 - `sudo ./scrub.sh --force --prune-duplicates`
+
+Prune zombie initrd entries (kernel exists but initrd missing/corrupt) (NOT recommended; prefer repair):
+- `sudo ./scrub.sh --force --prune-zombies`
 
 Machine-readable output (JSON to stdout; logs go to stderr):
 - `sudo ./scrub.sh --dry-run --json`

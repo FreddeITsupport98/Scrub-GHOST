@@ -77,6 +77,7 @@ VERIFY_KERNEL_MODULES=true
 PRUNE_STALE_SNAPSHOTS=false
 PRUNE_UNINSTALLED_KERNELS=false
 PRUNE_DUPLICATES=false
+PRUNE_ZOMBIES=false
 CONFIRM_PRUNE_UNINSTALLED=false
 
 # Backup knobs (enabled automatically when applying changes)
@@ -145,6 +146,7 @@ Verification / pruning (all safe by default; pruning requires --force):
   --prune-stale-snapshots Move/delete snapper entries whose snapshot number doesn't exist
   --prune-uninstalled     Move/delete entries whose kernel modules dir is missing (requires --confirm-uninstalled)
   --prune-duplicates      Move/delete duplicate entries with identical boot payload (linux+initrd+options)
+  --prune-zombies         Move/delete "zombie" entries (kernel exists but initrd missing/corrupt) (recommended: repair instead)
   --confirm-uninstalled   Required extra safety flag to actually prune uninstalled-kernel entries
 
   -h, --help             Show this help
@@ -205,6 +207,7 @@ _arguments -s \
   '--prune-stale-snapshots[prune stale snapper entries (requires --force)]' \
   '--prune-uninstalled[prune uninstalled-kernel entries (requires --confirm-uninstalled)]' \
   '--prune-duplicates[prune duplicate boot entries]' \
+  '--prune-zombies[prune zombie entries (kernel OK, initrd missing/corrupt)]' \
   '--confirm-uninstalled[extra confirmation for --prune-uninstalled]' \
   '--completion=[print completion script]:shell:(zsh bash)'
 EOF
@@ -215,7 +218,7 @@ EOF
 _scrub_ghost_complete() {
   local cur
   cur="${COMP_WORDS[COMP_CWORD]}"
-  local opts="--dry-run --force --delete --backup-dir --backup-root --keep-backups --entries-dir --boot-dir --rebuild-grub --grub-cfg --update-sdboot --no-remount-rw --json --no-color --verbose --debug --log-file --menu --rescue --list-backups --restore-latest --restore-best --restore-pick --restore-from --clean-restore --restore-anyway --validate-latest --validate-pick --validate-from --no-backup --no-snapper-backup --no-verify-snapshots --no-verify-modules --prune-stale-snapshots --prune-uninstalled --prune-duplicates --confirm-uninstalled --completion --help"
+  local opts="--dry-run --force --delete --backup-dir --backup-root --keep-backups --entries-dir --boot-dir --rebuild-grub --grub-cfg --update-sdboot --no-remount-rw --json --no-color --verbose --debug --log-file --menu --rescue --list-backups --restore-latest --restore-best --restore-pick --restore-from --clean-restore --restore-anyway --validate-latest --validate-pick --validate-from --no-backup --no-snapper-backup --no-verify-snapshots --no-verify-modules --prune-stale-snapshots --prune-uninstalled --prune-duplicates --prune-zombies --confirm-uninstalled --completion --help"
   COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
 }
 
@@ -449,8 +452,8 @@ json_emit() {
     printf '%s' "$item"
   done
 
-  printf '],"summary":{"ok":%d,"ghost":%d,"stale_snapshot":%d,"uninstalled_kernel":%d,"duplicate_found":%d,"duplicate_pruned":%d,"protected_snapshots":%d,"protected_kernels":%d,"skipped":%d,"changed":%d}}\n' \
-    "$ok_count" "$ghost_count" "$stale_snapshot_count" "$uninstalled_kernel_count" \
+  printf '],"summary":{"ok":%d,"ghost":%d,"zombie_initrd":%d,"stale_snapshot":%d,"uninstalled_kernel":%d,"duplicate_found":%d,"duplicate_pruned":%d,"protected_snapshots":%d,"protected_kernels":%d,"skipped":%d,"changed":%d}}\n' \
+    "$ok_count" "$ghost_count" "$zombie_initrd_count" "$stale_snapshot_count" "$uninstalled_kernel_count" \
     "$duplicate_found_count" "$duplicate_pruned_count" "$protected_count" "$protected_kernel_count" \
     "$skipped_count" "$moved_or_deleted_count"
 }
@@ -1832,6 +1835,9 @@ while [[ $# -gt 0 ]]; do
     --prune-duplicates)
       PRUNE_DUPLICATES=true
       ;;
+    --prune-zombies)
+      PRUNE_ZOMBIES=true
+      ;;
     --confirm-uninstalled)
       CONFIRM_PRUNE_UNINSTALLED=true
       ;;
@@ -2050,6 +2056,9 @@ recommend_action() {
       ;;
     duplicate)
       printf '%b%d found%b -> %bPrune (Safe)%b' "$C_YELLOW" "$count" "$C_RESET" "$C_BOLD" "$C_RESET"
+      ;;
+    zombie)
+      printf '%b%d found%b -> %bRepair (dracut suggested)%b' "$C_YELLOW" "$count" "$C_RESET" "$C_DIM" "$C_RESET"
       ;;
     stale)
       printf '%b%d found%b -> %bKeep (Manual review suggested)%b' "$C_YELLOW" "$count" "$C_RESET" "$C_DIM" "$C_RESET"
@@ -2311,8 +2320,9 @@ menu_auto_fix() {
       "${COMMON_FLAGS[@]}" --log-file /dev/null 2>/dev/null || true)"
 
     # 2) Parse summary integers
-    local n_ghost n_stale n_dupe n_uninstall
+    local n_ghost n_zombie n_stale n_dupe n_uninstall
     n_ghost="$(json_summary_int "$json_output" ghost)"
+    n_zombie="$(json_summary_int "$json_output" zombie_initrd)"
     n_stale="$(json_summary_int "$json_output" stale_snapshot)"
     n_dupe="$(json_summary_int "$json_output" duplicate_found)"
     n_uninstall="$(json_summary_int "$json_output" uninstalled_kernel)"
@@ -2323,6 +2333,7 @@ menu_auto_fix() {
     log " 0. Boot Storage:        $storage_status"
     log " 0. Boot Redundancy:     $redundancy_status"
     log " 1. Ghost Entries:       $(recommend_action "$n_ghost" ghost)"
+    log " 1b. Zombie Initrd:      $(recommend_action "$n_zombie" zombie)"
     local orphans
     orphans="$(scan_orphaned_files 2>/dev/null || printf 'None\n')"
 
@@ -2361,7 +2372,7 @@ menu_auto_fix() {
 
     local total_safe total_issues
     total_safe=$((n_ghost + n_dupe))
-    total_issues=$((n_ghost + n_dupe + n_stale + n_uninstall))
+    total_issues=$((n_ghost + n_dupe + n_zombie + n_stale + n_uninstall))
 
     if [[ "$total_issues" -eq 0 ]]; then
       log "${C_GREEN}System is clean! No actions needed.${C_RESET}"
@@ -2376,6 +2387,7 @@ menu_auto_fix() {
     fi
     log "  ${C_BOLD}ALL${C_RESET})  Apply ALL fixes (includes Stale Snapshots)"
     log "  ${C_BOLD}K${C_RESET})    Also prune uninstalled kernels (aggressive; requires YES + --confirm-uninstalled)"
+    log "  ${C_BOLD}Z${C_RESET})    Remove zombie initrd entries (NOT recommended; prefer repair)"
     log "  ${C_BOLD}S${C_RESET})    View detailed dry-run output"
     log "  ${C_BOLD}B${C_RESET})    Back"
 
@@ -2462,6 +2474,29 @@ menu_auto_fix() {
         read -r -p "> " yn </dev/tty || true
         if [[ "$yn" == "YES" ]]; then
           run_sub_minimal --force --prune-duplicates --prune-stale-snapshots --prune-uninstalled --confirm-uninstalled
+          log ""
+          log "${C_BOLD}Verifying fixes...${C_RESET}"
+          sleep 1
+          continue
+        else
+          log "Cancelled."
+        fi
+        prompt_enter_to_continue
+        ;;
+
+      Z|z)
+        if [[ "$n_zombie" -le 0 ]]; then
+          log "No zombie initrd entries found."
+          prompt_enter_to_continue
+          continue
+        fi
+
+        warn "Zombie initrd entries are often repairable. Prefer running the suggested dracut command(s)."
+        log "Type ZOMBIE to confirm removal (enables --prune-zombies):"
+        local yn
+        read -r -p "> " yn </dev/tty || true
+        if [[ "$yn" == "ZOMBIE" ]]; then
+          run_sub_minimal --force --prune-zombies
           log ""
           log "${C_BOLD}Verifying fixes...${C_RESET}"
           sleep 1
@@ -3311,6 +3346,7 @@ log "========================================"
 
 ok_count=0
 ghost_count=0
+zombie_initrd_count=0
 protected_count=0
 protected_kernel_count=0
 critical_kernel_count=0
@@ -3968,6 +4004,83 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   fi
 
   # Something missing -> likely a ghost/broken entry.
+  # Special case: kernel exists but initrd is missing/corrupt => "zombie" (repairable).
+  if [[ "${missing_kernel:-false}" == false && "${missing_initrd:-false}" == true ]]; then
+    zombie_initrd_count=$((zombie_initrd_count + 1))
+
+    log ""
+    log "${C_YELLOW}[ZOMBIE-INITRD]${C_RESET} $(basename -- "$entry") ${C_DIM}(kernel exists, initrd missing/corrupt)${C_RESET}"
+    log "        linux:   $kernel_path"
+    log "        lookup:  $kernel_full"
+    if [[ -n "${initrd_path:-}" ]]; then
+      log "        initrd:  $initrd_path"
+      log "        lookup:  ${initrd_full:-<unresolved>}"
+    fi
+
+    # Snapshot entries remain protected.
+    if [[ "$snap_present" == true ]]; then
+      log "        action:  ${C_BLUE}SKIP${C_RESET} (protected snapshot entry)"
+      protected_count=$((protected_count + 1))
+      json_add_result "$(basename -- "$entry")" "PROTECTED-SNAPSHOT" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "snapshot exists"
+      continue
+    fi
+
+    # By default we do NOT prune these: suggest repair.
+    if [[ "$PRUNE_ZOMBIES" != true ]]; then
+      local sug
+      sug=""
+      if [[ -n "${entry_kver:-}" ]]; then
+        sug="sudo dracut --force --kver ${entry_kver}"
+      fi
+
+      if [[ "$DRY_RUN" == true ]]; then
+        log "        action:  ${C_BLUE}SKIP${C_RESET} (repair suggested)"
+        json_add_result "$(basename -- "$entry")" "ZOMBIE-INITRD" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "repair suggested"
+      else
+        log "        action:  ${C_BLUE}SKIP${C_RESET} (repair suggested; enable --prune-zombies to remove)"
+        [[ -n "$sug" ]] && log "        suggestion: ${C_DIM}$sug${C_RESET}"
+        json_add_result "$(basename -- "$entry")" "ZOMBIE-INITRD" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "repair suggested"
+      fi
+      continue
+    fi
+
+    # Prune zombies only when explicitly requested.
+    if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true || "$is_grub_default" == true ]]; then
+      log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel/default)"
+      protected_kernel_count=$((protected_kernel_count + 1))
+      json_add_result "$(basename -- "$entry")" "PROTECTED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "zombie initrd but protected kernel/default"
+      continue
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+      if [[ "$DELETE_MODE" == "delete" ]]; then
+        log "        action:  (dry-run) would DELETE zombie entry"
+        json_add_result "$(basename -- "$entry")" "ZOMBIE-INITRD" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "DRYRUN" "would delete zombie"
+      else
+        log "        action:  (dry-run) would MOVE zombie entry to backup"
+        json_add_result "$(basename -- "$entry")" "ZOMBIE-INITRD" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "DRYRUN" "would move zombie"
+      fi
+      continue
+    fi
+
+    if [[ "$DELETE_MODE" == "delete" ]]; then
+      log "        action:  deleting zombie entry file"
+      log_audit "ACTION=DELETE file=$entry reason=ZOMBIE-INITRD"
+      rm -f -- "$entry"
+      moved_or_deleted_count=$((moved_or_deleted_count + 1))
+      json_add_result "$(basename -- "$entry")" "ZOMBIE-INITRD" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "DELETE" "zombie initrd"
+    else
+      ensure_backup_dir
+      log "        action:  moving zombie entry file -> $BACKUP_DIR"
+      log_audit "ACTION=MOVE file=$entry dest=$BACKUP_DIR reason=ZOMBIE-INITRD"
+      move_entry_to_backup_dir "$entry" "$BACKUP_DIR"
+      moved_or_deleted_count=$((moved_or_deleted_count + 1))
+      json_add_result "$(basename -- "$entry")" "ZOMBIE-INITRD" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "MOVE" "zombie initrd"
+    fi
+
+    continue
+  fi
+
   ghost_count=$((ghost_count + 1))
 
   log ""
@@ -4108,6 +4221,7 @@ log "========================================"
 log " Summary"
 log "   OK entries:           $ok_count"
 log "   Ghost entries:        $ghost_count"
+log "   Zombie initrd:        $zombie_initrd_count"
 log "   Protected snapshots:  $protected_count"
 log "   Protected kernels:    $protected_kernel_count"
 log "   Critical kernels:     $critical_kernel_count"
