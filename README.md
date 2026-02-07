@@ -44,10 +44,13 @@ Recommended for most users:
 Smart behavior highlights:
 - Shows **boot storage health** (useful when /boot or ESP is full).
 - Shows **boot redundancy** (how many unique kernel versions have at least one bootable BLS entry). If you only have 1, Smart Auto-Fix will require an extra confirmation.
+- Checks **GRUB default entry health** (saved_entry) and can fix a broken saved default by setting it to the latest detected kernel entry.
 - Shows an **orphaned images** estimate (kernel/initrd files in `BOOT_DIR` that are not referenced by any current BLS entry).
 - Offers **Smart Repair** suggestions when it finds entries where the kernel exists but the initrd is missing/corrupt (suggested `dracut --force --kver ...`). These are reported as `ZOMBIE-INITRD` and are **not removed by default**.
+- Offers an **Active Healer** option to reinstall RPM-owned corrupt kernel packages (runs `zypper in -f ...` after confirmation).
+- Supports **pinning**: entries listed in `ENTRIES_DIR/.scrub-ghost-pinned` are never modified/pruned.
 - After applying a fix, it automatically **re-scans** to verify the counts dropped.
-- Duplicate detection uses a two-pass index so it keeps the “best” candidate automatically (prefers protected snapshot/kernel/default entries; otherwise keeps the newest mtime).
+- Duplicate detection uses a two-pass index so it keeps the “best” candidate automatically (prefers pinned/snapshot/kernel/default entries; otherwise keeps the newest mtime).
 - If a kernel image is detected as corrupt (0 bytes **or** RPM checksum mismatch) and it is owned by an RPM, the tool suggests a repair command (`zypper in -f <pkg>`).
 
 Safe cleanup (moves entries to a backup directory; does not hard-delete):
@@ -265,6 +268,12 @@ Remove hook:
 
 ## Notes
 - **Argument validation:** unknown options (or options missing required values) will print an error and exit. Use `-h` or `--help` to see the full usage.
+- **Pinning / manual overrides:** if `ENTRIES_DIR/.scrub-ghost-pinned` exists, any entry listed in it will be treated as `PINNED` and will never be moved/deleted. You can manage this file via the menu: `Settings -> Manage pinned entries`.
+  You can pin by:
+  - filename (e.g. `abcd.conf`)
+  - entry id (e.g. `abcd`)
+  - kernel version string (e.g. `6.9.1-1-default`)
+  Lines can be commented with `#`.
 - Ghost/broken entry detection checks not only the `linux` path but also `initrd` (if present) and `devicetree` (if present). If any referenced file is missing, the entry is flagged as a ghost/broken entry. If an entry has multiple `initrd` lines, **all** initrds must exist.
 - **Quoted values:** BLS allows quoted values containing spaces (e.g. `linux "/EFI/My Folder/linux.efi"`). The parser supports this for path-like keys.
 - **Corruption detection:** a kernel file that exists but is **0 bytes** is treated as broken (common when the ESP runs out of space). If the kernel file is owned by an RPM package, the tool also runs a lightweight `rpm -Vf` check and flags **checksum mismatches** as corrupt (`CORRUPT-CSUM`).

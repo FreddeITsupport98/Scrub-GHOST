@@ -452,8 +452,8 @@ json_emit() {
     printf '%s' "$item"
   done
 
-  printf '],"summary":{"ok":%d,"ghost":%d,"zombie_initrd":%d,"stale_snapshot":%d,"uninstalled_kernel":%d,"duplicate_found":%d,"duplicate_pruned":%d,"protected_snapshots":%d,"protected_kernels":%d,"skipped":%d,"changed":%d}}\n' \
-    "$ok_count" "$ghost_count" "$zombie_initrd_count" "$stale_snapshot_count" "$uninstalled_kernel_count" \
+  printf '],"summary":{"ok":%d,"ghost":%d,"zombie_initrd":%d,"pinned":%d,"stale_snapshot":%d,"uninstalled_kernel":%d,"duplicate_found":%d,"duplicate_pruned":%d,"protected_snapshots":%d,"protected_kernels":%d,"skipped":%d,"changed":%d}}\n' \
+    "$ok_count" "$ghost_count" "$zombie_initrd_count" "$pinned_count" "$stale_snapshot_count" "$uninstalled_kernel_count" \
     "$duplicate_found_count" "$duplicate_pruned_count" "$protected_count" "$protected_kernel_count" \
     "$skipped_count" "$moved_or_deleted_count"
 }
@@ -2220,6 +2220,166 @@ scan_orphaned_files() {
   fi
 }
 
+pinned_config_path() {
+  printf '%s\n' "$ENTRIES_DIR/.scrub-ghost-pinned"
+}
+
+is_pinned() {
+  # A pin can be:
+  #  - the full filename (e.g. "abcdef.conf")
+  #  - the entry id (filename without .conf)
+  #  - a kernel version string (optional; only checked when provided)
+  local entry_file="$1"
+  local entry_kver="${2-}"
+
+  local pin_file
+  pin_file="$(pinned_config_path)"
+  [[ -f "$pin_file" ]] || return 1
+
+  local entry_name entry_id
+  entry_name="$(basename -- "$entry_file")"
+  entry_id="$(basename -- "$entry_file" .conf)"
+
+  local pins
+  pins="$(awk '
+    /^[[:space:]]*#/ {next}
+    NF==0 {next}
+    {gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print}
+  ' "$pin_file" 2>/dev/null || true)"
+
+  [[ -n "$pins" ]] || return 1
+
+  if printf '%s\n' "$pins" | grep -Fxq -- "$entry_name"; then
+    return 0
+  fi
+  if printf '%s\n' "$pins" | grep -Fxq -- "$entry_id"; then
+    return 0
+  fi
+  if [[ -n "$entry_kver" ]] && printf '%s\n' "$pins" | grep -Fxq -- "$entry_kver"; then
+    return 0
+  fi
+
+  return 1
+}
+
+check_default_entry_health() {
+  # Checks if GRUB saved_entry points to an existing BLS file.
+  local def_id
+  def_id="${GRUB_DEFAULT_ID:-}"
+  [[ -z "$def_id" ]] && def_id="$(get_grub_default_id 2>/dev/null || true)"
+
+  if [[ -z "$def_id" ]]; then
+    printf '%bN/A%b' "$C_DIM" "$C_RESET"
+    return 0
+  fi
+
+  local expected="$ENTRIES_DIR/${def_id}.conf"
+  if [[ ! -e "$expected" ]]; then
+    printf '%bBROKEN (Points to missing: %s)%b' "$C_RED" "$def_id" "$C_RESET"
+    return 2
+  fi
+
+  printf '%bHEALTHY (%s)%b' "$C_GREEN" "$def_id" "$C_RESET"
+  return 0
+}
+
+find_entry_id_for_kver() {
+  # $1=kver -> prints entry id (basename without .conf) of the first matching BLS entry.
+  local kver="$1"
+  [[ -n "$kver" ]] || return 1
+
+  local f
+  for f in "$ENTRIES_DIR"/*.conf; do
+    [[ -e "$f" ]] || continue
+
+    local kp
+    kp="$(bls_linux_path "$f")"
+    [[ -n "$kp" ]] || continue
+
+    local kv
+    kv="$(kernel_version_from_linux_path "$kp" 2>/dev/null || true)"
+    if [[ -n "$kv" && "$kv" == "$kver" ]]; then
+      basename -- "$f" .conf
+      return 0
+    fi
+
+    if path_mentions_kver "$kp" "$kver"; then
+      basename -- "$f" .conf
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+rpm_file_digest_mismatch() {
+  # Returns 0 if rpm -Vf indicates a digest mismatch for this file.
+  local p="$1"
+  command -v rpm >/dev/null 2>&1 || return 1
+  [[ -n "$p" && -f "$p" ]] || return 1
+
+  local out
+  out="$(rpm -Vf -- "$p" 2>/dev/null || true)"
+  [[ -n "$out" ]] || return 1
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    local flags path
+    flags="${line%%[[:space:]]*}"
+    path="$(awk '{print $NF}' <<<"$line")"
+    if [[ "$path" == "$p" && "$flags" == *5* ]]; then
+      return 0
+    fi
+  done <<<"$out"
+
+  return 1
+}
+
+scan_corrupt_kernel_packages() {
+  # Prints unique RPM package *names* that own kernel images which look corrupt.
+  # Corrupt = 0 bytes OR rpm digest mismatch.
+  command -v rpm >/dev/null 2>&1 || return 0
+
+  local -a targets
+  targets=()
+
+  local f
+  for f in "$ENTRIES_DIR"/*.conf; do
+    [[ -e "$f" ]] || continue
+
+    local kp kfull
+    kp="$(bls_linux_path "$f")"
+    [[ -n "$kp" ]] || continue
+
+    kfull="$(resolve_boot_path "$kp" 2>/dev/null || true)"
+    [[ -n "$kfull" && -f "$kfull" ]] || continue
+
+    local corrupt=false
+    if [[ ! -s "$kfull" ]]; then
+      corrupt=true
+    elif rpm_file_digest_mismatch "$kfull"; then
+      corrupt=true
+    fi
+
+    if [[ "$corrupt" == true ]]; then
+      local owners
+      owners="$(rpm -qf --queryformat '%{NAME}\n' -- "$kfull" 2>/dev/null || true)"
+      if [[ -n "$owners" && "$owners" != *"not owned"* ]]; then
+        while IFS= read -r o; do
+          [[ -n "$o" ]] || continue
+          targets+=("$o")
+        done <<<"$owners"
+      fi
+    fi
+  done
+
+  if (( ${#targets[@]} == 0 )); then
+    return 0
+  fi
+
+  printf '%s\n' "${targets[@]}" | sort -u
+}
+
 scan_repairable_entries() {
   # Scans for entries where kernel exists but one or more initrds are missing/invalid.
   # Prints suggested dracut commands (one per kver), or nothing.
@@ -2311,6 +2471,11 @@ menu_auto_fix() {
     redundancy_status="$(check_kernel_redundancy)"
     redundancy_rc=$?
 
+    # 0c) Sysadmin safety: GRUB default entry health (saved_entry)
+    local def_health def_health_rc
+    def_health="$(check_default_entry_health)"
+    def_health_rc=$?
+
     # 1) Silent dry-run analysis in JSON mode (no jq dependency)
     build_common_flags_minimal
     local json_output
@@ -2332,6 +2497,7 @@ menu_auto_fix() {
     log "---------------------------------------------------"
     log " 0. Boot Storage:        $storage_status"
     log " 0. Boot Redundancy:     $redundancy_status"
+    log " 0. Default Entry:       $def_health"
     log " 1. Ghost Entries:       $(recommend_action "$n_ghost" ghost)"
     log " 1b. Zombie Initrd:      $(recommend_action "$n_zombie" zombie)"
     local orphans
@@ -2347,6 +2513,10 @@ menu_auto_fix() {
       warn "Boot redundancy is CRITICAL (only one valid kernel). Avoid aggressive cleanup until you install/keep a fallback kernel."
     elif [[ "$redundancy_rc" -eq 1 ]]; then
       warn "Boot redundancy is MINIMAL (two kernels). Consider keeping at least one extra fallback before aggressive cleanup."
+    fi
+
+    if [[ "$def_health_rc" -eq 2 ]]; then
+      warn "GRUB saved default entry is BROKEN. Consider fixing it (SET-DEF) to avoid unpredictable boots."
     fi
 
     if [[ "$storage_rc" -eq 2 && "$n_uninstall" -gt 0 ]]; then
@@ -2370,6 +2540,14 @@ menu_auto_fix() {
       done <<<"$repair_suggestions"
     fi
 
+    # Active healer: find RPM packages that own corrupt kernel images.
+    local corrupt_pkg_list corrupt_pkg_count
+    corrupt_pkg_list="$(scan_corrupt_kernel_packages 2>/dev/null || true)"
+    corrupt_pkg_count=0
+    if [[ -n "$corrupt_pkg_list" ]]; then
+      corrupt_pkg_count="$(printf '%s\n' "$corrupt_pkg_list" | wc -l | tr -dc '0-9' || echo 0)"
+    fi
+
     local total_safe total_issues
     total_safe=$((n_ghost + n_dupe))
     total_issues=$((n_ghost + n_dupe + n_zombie + n_stale + n_uninstall))
@@ -2382,6 +2560,12 @@ menu_auto_fix() {
 
     log ""
     log "Options:"
+    if [[ "$def_health_rc" -eq 2 && -n "$LATEST_INSTALLED_VER" ]]; then
+      log "  ${C_BOLD}SET-DEF${C_RESET}) Correct default entry (set to latest: $LATEST_INSTALLED_VER)"
+    fi
+    if [[ "$corrupt_pkg_count" -gt 0 ]]; then
+      log "  ${C_BOLD}HEAL${C_RESET})    Reinstall corrupt kernel packages ($corrupt_pkg_count)"
+    fi
     if [[ "$total_safe" -gt 0 ]]; then
       log "  ${C_BOLD}FIX${C_RESET})  Apply SAFE fixes only (Ghosts + Duplicates)"
     fi
@@ -2395,6 +2579,82 @@ menu_auto_fix() {
     read -r -p "> " choice </dev/tty || return 0
 
     case "$choice" in
+      SET-DEF|set-def|setdef|SETDEF)
+        if [[ "$def_health_rc" -ne 2 ]]; then
+          log "Default entry looks healthy (nothing to fix)."
+          prompt_enter_to_continue
+          continue
+        fi
+        if [[ -z "$LATEST_INSTALLED_VER" ]]; then
+          err "Cannot set default: latest kernel version not detected."
+          prompt_enter_to_continue
+          continue
+        fi
+
+        local latest_id
+        latest_id="$(find_entry_id_for_kver "$LATEST_INSTALLED_VER" 2>/dev/null || true)"
+        if [[ -z "$latest_id" ]]; then
+          err "Could not find a BLS entry for latest kernel version: $LATEST_INSTALLED_VER"
+          prompt_enter_to_continue
+          continue
+        fi
+
+        if ! command -v grub2-set-default >/dev/null 2>&1; then
+          err "grub2-set-default not found."
+          prompt_enter_to_continue
+          continue
+        fi
+
+        log "Running: grub2-set-default '$latest_id'"
+        if grub2-set-default "$latest_id"; then
+          GRUB_DEFAULT_ID="$latest_id"
+          log "${C_GREEN}Fixed! Default is now $latest_id${C_RESET}"
+        else
+          err "Failed to set default."
+        fi
+        prompt_enter_to_continue
+        continue
+        ;;
+
+      HEAL|heal)
+        if [[ "$corrupt_pkg_count" -le 0 ]]; then
+          log "No RPM-owned corrupt kernel packages detected."
+          prompt_enter_to_continue
+          continue
+        fi
+        if ! command -v zypper >/dev/null 2>&1; then
+          err "zypper not found; cannot run active repair."
+          prompt_enter_to_continue
+          continue
+        fi
+
+        log "${C_BOLD}Active Repair${C_RESET}"
+        log "About to reinstall packages:"
+        while IFS= read -r p; do
+          [[ -n "$p" ]] || continue
+          log "  ${C_DIM}$p${C_RESET}"
+        done <<<"$corrupt_pkg_list"
+
+        log "Type YES to proceed:" 
+        local yn
+        read -r -p "> " yn </dev/tty || true
+        if [[ "$yn" == "YES" ]]; then
+          declare -a pkgs
+          pkgs=()
+          mapfile -t pkgs < <(printf '%s\n' "$corrupt_pkg_list" | awk 'NF{print}' | sort -u)
+          if (( ${#pkgs[@]} > 0 )); then
+            zypper -n in -f "${pkgs[@]}" || true
+            log "Reinstall complete. Re-scanning..."
+            sleep 1
+            continue
+          fi
+        else
+          log "Cancelled."
+        fi
+
+        prompt_enter_to_continue
+        ;;
+
       FIX|fix|F|f)
         if [[ "$total_safe" -eq 0 ]]; then
           log "No safe fixes available."
@@ -3188,6 +3448,209 @@ menu_restore() {
   done
 }
 
+menu_pins() {
+  while true; do
+    menu_header
+
+    local pin_file
+    pin_file="$(pinned_config_path)"
+
+    log "Pinned entries manager"
+    log "Pin file: $pin_file"
+    log ""
+    log "Pins can be:"
+    log "  - filename (e.g. abcd.conf)"
+    log "  - entry id  (e.g. abcd)"
+    log "  - kernel version (e.g. 6.9.1-1-default)"
+    log ""
+    log "1) View pins"
+    log "2) Add pin"
+    log "3) Remove pin"
+    log "4) Edit pin file (opens $EDITOR)"
+    log "5) Back"
+
+    local choice
+    read -r -p "> " choice </dev/tty || return 0
+
+    case "$choice" in
+      1)
+        if [[ -f "$pin_file" ]]; then
+          log ""
+          log "Pins:"
+          local n
+          n=0
+          while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            n=$((n + 1))
+            log "  $n) $line"
+          done < <(
+            awk '
+              /^[[:space:]]*#/ {next}
+              NF==0 {next}
+              {gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print}
+            ' "$pin_file" 2>/dev/null || true
+          )
+          if [[ "$n" -eq 0 ]]; then
+            log "  (none)"
+          fi
+        else
+          log "No pin file found."
+        fi
+        prompt_enter_to_continue
+        ;;
+
+      2)
+        maybe_temp_remount_rw_for_path "$ENTRIES_DIR" "entries dir (pin file)"
+        mkdir -p -- "$ENTRIES_DIR" 2>/dev/null || true
+        touch -- "$pin_file" 2>/dev/null || true
+
+        log "Enter pin to add (exact match):"
+        local pin
+        read -r -p "> " pin </dev/tty || true
+        pin="$(printf '%s' "$pin" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+
+        if [[ -z "$pin" ]]; then
+          log "Cancelled."
+          prompt_enter_to_continue
+          continue
+        fi
+        if [[ "$pin" =~ [[:space:]] ]]; then
+          err "Pins must not contain whitespace (use exact filename/id/kver)."
+          prompt_enter_to_continue
+          continue
+        fi
+
+        if awk '
+          /^[[:space:]]*#/ {next}
+          NF==0 {next}
+          {gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print}
+        ' "$pin_file" 2>/dev/null | grep -Fxq -- "$pin"; then
+          log "Already pinned: $pin"
+          prompt_enter_to_continue
+          continue
+        fi
+
+        printf '%s\n' "$pin" >>"$pin_file" 2>/dev/null || {
+          err "Failed to write: $pin_file"
+          prompt_enter_to_continue
+          continue
+        }
+
+        log "Pinned: $pin"
+        prompt_enter_to_continue
+        ;;
+
+      3)
+        if [[ ! -f "$pin_file" ]]; then
+          log "No pin file found."
+          prompt_enter_to_continue
+          continue
+        fi
+
+        declare -a pins
+        pins=()
+        mapfile -t pins < <(
+          awk '
+            /^[[:space:]]*#/ {next}
+            NF==0 {next}
+            {gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print}
+          ' "$pin_file" 2>/dev/null || true
+        )
+
+        if (( ${#pins[@]} == 0 )); then
+          log "No pins to remove."
+          prompt_enter_to_continue
+          continue
+        fi
+
+        log "Select pin to remove:"
+        local i
+        for (( i=0; i<${#pins[@]}; i++ )); do
+          log "  $((i+1))) ${pins[$i]}"
+        done
+        local n
+        read -r -p "> " n </dev/tty || true
+        if ! [[ "$n" =~ ^[0-9]+$ ]] || (( n < 1 || n > ${#pins[@]} )); then
+          err "Invalid selection."
+          prompt_enter_to_continue
+          continue
+        fi
+
+        local target
+        target="${pins[$((n-1))]}"
+
+        log "Type YES to remove '$target':"
+        local yn
+        read -r -p "> " yn </dev/tty || true
+        if [[ "$yn" != "YES" ]]; then
+          log "Cancelled."
+          prompt_enter_to_continue
+          continue
+        fi
+
+        maybe_temp_remount_rw_for_path "$ENTRIES_DIR" "entries dir (pin file)"
+
+        local tmp
+        tmp="$pin_file.tmp.$$"
+        awk -v target="$target" '
+          {
+            orig=$0
+            line=$0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            if (line ~ /^#/ || line == "") { print orig; next }
+            if (line == target) { next }
+            print orig
+          }
+        ' "$pin_file" >"$tmp" 2>/dev/null || {
+          err "Failed to update pin file."
+          rm -f -- "$tmp" 2>/dev/null || true
+          prompt_enter_to_continue
+          continue
+        }
+        mv -f -- "$tmp" "$pin_file" 2>/dev/null || {
+          err "Failed to write pin file."
+          rm -f -- "$tmp" 2>/dev/null || true
+          prompt_enter_to_continue
+          continue
+        }
+
+        log "Removed pin: $target"
+        prompt_enter_to_continue
+        ;;
+
+      4)
+        maybe_temp_remount_rw_for_path "$ENTRIES_DIR" "entries dir (pin file)"
+        mkdir -p -- "$ENTRIES_DIR" 2>/dev/null || true
+        touch -- "$pin_file" 2>/dev/null || true
+
+        local editor
+        editor="${EDITOR:-}"
+
+        if [[ -n "$editor" ]]; then
+          # Support multi-word EDITOR (e.g. "vim -u NONE").
+          bash -c "$editor \"\$1\"" _ "$pin_file" </dev/tty >/dev/tty 2>&1 || true
+        elif command -v nano >/dev/null 2>&1; then
+          nano "$pin_file" </dev/tty >/dev/tty 2>&1 || true
+        elif command -v vim >/dev/null 2>&1; then
+          vim "$pin_file" </dev/tty >/dev/tty 2>&1 || true
+        else
+          vi "$pin_file" </dev/tty >/dev/tty 2>&1 || true
+        fi
+        ;;
+
+      5)
+        return 0
+        ;;
+
+      *)
+        log "Invalid option."
+        prompt_enter_to_continue
+        ;;
+    esac
+  done
+}
+
 menu_settings() {
   while true; do
     menu_header
@@ -3202,7 +3665,8 @@ menu_settings() {
     log "8) Toggle prune duplicates (currently: $PRUNE_DUPLICATES)"
     log "9) Toggle JSON output      (currently: $JSON_OUTPUT)"
     log "10) Set keep backups (currently: $KEEP_BACKUPS)"
-    log "11) Back"
+    log "11) Manage pinned entries (pin file)"
+    log "12) Back"
 
     local choice
     read -r -p "> " choice </dev/tty || return 0
@@ -3232,7 +3696,10 @@ menu_settings() {
           log "Invalid number."
         fi
         ;;
-      11) return 0 ;;
+      11)
+        menu_pins
+        ;;
+      12) return 0 ;;
       *) log "Invalid option." ;;
     esac
 
@@ -3347,6 +3814,7 @@ log "========================================"
 ok_count=0
 ghost_count=0
 zombie_initrd_count=0
+pinned_count=0
 protected_count=0
 protected_kernel_count=0
 critical_kernel_count=0
@@ -3377,12 +3845,20 @@ JSON_RESULTS=()
 
 compute_duplicate_protection_score() {
   # Prints a numeric score (higher = prefer keeping this entry).
+  # 4 = pinned (listed in .scrub-ghost-pinned)
   # 3 = GRUB default (saved_entry matches BLS id)
   # 2 = protected snapshot
   # 1 = protected kernel (running/latest)
   # 0 = normal
   local entry_file="$1"
   local kernel_path="$2"
+
+  local kver
+  kver="$(kernel_version_from_linux_path "$kernel_path" 2>/dev/null || true)"
+  if is_pinned "$entry_file" "$kver"; then
+    printf '4\n'
+    return 0
+  fi
 
   if entry_is_grub_default "$entry_file"; then
     printf '3\n'
@@ -3406,8 +3882,6 @@ compute_duplicate_protection_score() {
   fi
 
   # Protected kernel check
-  local kver
-  kver="$(kernel_version_from_linux_path "$kernel_path" 2>/dev/null || true)"
 
   if [[ -n "$RUNNING_KERNEL_VER" ]]; then
     if [[ -n "$kver" && "$kver" == "$RUNNING_KERNEL_VER" ]] || path_mentions_kver "$kernel_path" "$RUNNING_KERNEL_VER"; then
@@ -3813,6 +4287,26 @@ for entry in "$ENTRIES_DIR"/*.conf; do
         fi
       fi
     fi
+  fi
+
+  # Manual override: pinned entries are never modified/pruned.
+  if is_pinned "$entry" "$entry_kver"; then
+    pinned_count=$((pinned_count + 1))
+
+    local pin_status pin_details
+    pin_status="PINNED"
+    pin_details="pinned"
+
+    if [[ "$missing_kernel" == true || "$missing_initrd" == true || "$missing_devicetree" == true ]]; then
+      pin_status="PINNED-BROKEN"
+      pin_details="pinned but references missing/corrupt files"
+      warn "${C_YELLOW}[PINNED]${C_RESET} $(basename -- "$entry") is pinned but appears broken (will not prune)."
+    elif [[ "$VERBOSE" == true ]]; then
+      log "${C_BLUE}[PINNED]${C_RESET} $(basename -- "$entry")"
+    fi
+
+    json_add_result "$(basename -- "$entry")" "$pin_status" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "$pin_details"
+    continue
   fi
 
   # If nothing is missing, entry is potentially OK (then check duplicates / stale snapshot / uninstalled-kernel).
@@ -4222,6 +4716,7 @@ log " Summary"
 log "   OK entries:           $ok_count"
 log "   Ghost entries:        $ghost_count"
 log "   Zombie initrd:        $zombie_initrd_count"
+log "   Pinned entries:       $pinned_count"
 log "   Protected snapshots:  $protected_count"
 log "   Protected kernels:    $protected_kernel_count"
 log "   Critical kernels:     $critical_kernel_count"
