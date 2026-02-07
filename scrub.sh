@@ -242,8 +242,13 @@ log_to_file() {
   [[ -n "$LOG_FILE" ]] || return 0
 
   # Strip ANSI escapes before writing to file.
+  # Prefer sed -E for portability (BSD/macOS); fall back to sed -r (GNU).
   local line
-  line="$(printf '%b' "$*" | sed -r 's/\x1B\[[0-9;]*[mK]//g')"
+  line="$(
+    printf '%b' "$*" | {
+      sed -E 's/\x1B\[[0-9;]*[mK]//g' 2>/dev/null || sed -r 's/\x1B\[[0-9;]*[mK]//g'
+    }
+  )"
   printf '%s %s\n' "$(date -Is)" "$line" >>"$LOG_FILE" 2>/dev/null || true
 }
 
@@ -470,6 +475,72 @@ payload_signature() {
 }
 
 # Kernel guardrails
+kver_base_numeric() {
+  # Extract leading numeric version part (e.g. "6.8.1" from "6.8.1-default").
+  local v="$1"
+  if [[ "$v" =~ ^([0-9]+(\.[0-9]+)*) ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+kver_build_numeric() {
+  # Extract a numeric build suffix after a dash (e.g. "1" from "6.8.1-1-default").
+  local v="$1"
+  if [[ "$v" =~ ^[0-9]+(\.[0-9]+)*-([0-9]+) ]]; then
+    printf '%s\n' "${BASH_REMATCH[2]}"
+    return 0
+  fi
+  printf '0\n'
+}
+
+kver_is_newer() {
+  # Returns 0 if $1 is newer than $2 using a conservative numeric comparison.
+  # Handles common kernel module dir names like:
+  #   6.8.1-default, 6.8.10-default, 6.8.1-1-default
+  local a="$1" b="$2"
+  [[ -n "$a" && -n "$b" ]] || return 1
+
+  local abase bbase
+  abase="$(kver_base_numeric "$a" 2>/dev/null || true)"
+  bbase="$(kver_base_numeric "$b" 2>/dev/null || true)"
+  [[ -n "$abase" && -n "$bbase" ]] || return 1
+
+  local IFS='.'
+  local -a av bv
+  read -r -a av <<<"$abase"
+  read -r -a bv <<<"$bbase"
+
+  local i alen blen max
+  alen=${#av[@]}
+  blen=${#bv[@]}
+  max=$(( alen > blen ? alen : blen ))
+
+  for (( i=0; i<max; i++ )); do
+    local ai bi
+    ai=${av[$i]:-0}
+    bi=${bv[$i]:-0}
+    if (( 10#$ai > 10#$bi )); then
+      return 0
+    elif (( 10#$ai < 10#$bi )); then
+      return 1
+    fi
+  done
+
+  # Base numeric equal; compare numeric build suffix when present.
+  local abuild bbuild
+  abuild="$(kver_build_numeric "$a" 2>/dev/null || true)"
+  bbuild="$(kver_build_numeric "$b" 2>/dev/null || true)"
+  if [[ "$abuild" =~ ^[0-9]+$ && "$bbuild" =~ ^[0-9]+$ ]]; then
+    if (( 10#$abuild > 10#$bbuild )); then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
 compute_kernel_guardrails() {
   RUNNING_KERNEL_VER="$(uname -r 2>/dev/null || true)"
 
@@ -488,9 +559,39 @@ compute_kernel_guardrails() {
       } | awk 'NF{print}' | sort -uV | tail -n 1
     )"
   else
-    # Safer to have no "latest" protection than a wrong one.
-    LATEST_INSTALLED_VER=""
-    debug "sort -V not available; skipping latest-installed-kernel detection"
+    # Fallback: conservative numeric compare in bash.
+    # Only consider versions we can parse numerically; skip odd names so they can't "win" by accident.
+    local max_ver=""
+    local d
+    for d in /lib/modules/* /usr/lib/modules/*; do
+      [[ -d "$d" ]] || continue
+      local ver
+      ver="${d##*/}"
+      [[ -n "$ver" ]] || continue
+
+      # Skip versions that don't start with a numeric segment.
+      if ! kver_base_numeric "$ver" >/dev/null 2>&1; then
+        debug "latest-kernel fallback: skipping unparsable module dir: $ver"
+        continue
+      fi
+
+      if [[ -z "$max_ver" ]]; then
+        max_ver="$ver"
+      else
+        if kver_is_newer "$ver" "$max_ver"; then
+          max_ver="$ver"
+        fi
+      fi
+    done
+
+    if [[ -z "$max_ver" && -n "$RUNNING_KERNEL_VER" ]]; then
+      # Last-resort safety: at least protect the running kernel.
+      max_ver="$RUNNING_KERNEL_VER"
+      debug "latest-kernel fallback: no parseable module dirs found; using running kernel as latest: $max_ver"
+    fi
+
+    LATEST_INSTALLED_VER="$max_ver"
+    debug "sort -V not available; using bash fallback latest-installed-kernel detection: ${LATEST_INSTALLED_VER:-unknown}"
   fi
 
   debug "Running kernel: ${RUNNING_KERNEL_VER:-unknown}"
@@ -631,7 +732,7 @@ validate_backup_bootability() {
   # Strong validation: try to ensure the restored set won't obviously be broken.
   # Checks:
   # - each entry has linux path and it exists now
-  # - initrd (if present) exists now
+  # - initrd(s) (if present) exist now (BLS can include multiple initrd lines)
   # - snapper snapshots referenced still exist (if verification enabled)
   # - machine-id match if manifest provides it
   local src="$1"
@@ -678,12 +779,23 @@ validate_backup_bootability() {
       missing_kernel=$((missing_kernel + 1))
     fi
 
-    local ip
-    ip="$(bls_initrd_path "$f")"
-    if [[ -n "$ip" ]]; then
-      local ifull
-      ifull="$(resolve_boot_path "$ip" || true)"
-      if [[ -z "$ifull" || ! -s "$ifull" ]]; then
+    # BLS allows multiple initrd lines; treat as missing if ANY initrd is missing.
+    declare -a ips
+    ips=()
+    mapfile -t ips < <(bls_initrd_paths "$f")
+    if (( ${#ips[@]} > 0 )); then
+      local ip
+      local any_missing=false
+      for ip in "${ips[@]}"; do
+        [[ -n "$ip" ]] || continue
+        local ifull
+        ifull="$(resolve_boot_path "$ip" || true)"
+        if [[ -z "$ifull" || ! -s "$ifull" ]]; then
+          any_missing=true
+          break
+        fi
+      done
+      if [[ "$any_missing" == true ]]; then
         missing_initrd=$((missing_initrd + 1))
       fi
     fi
@@ -874,14 +986,38 @@ resolve_boot_path() {
 
 snapshot_dir_from_entry() {
   # Extracts a Snapper snapshot dir like /.snapshots/123/snapshot (if present).
+  # IMPORTANT: only consider real BLS lines (linux/linuxefi/options), not comments.
   # Returns the first match on stdout.
-  grep -Eo '/\.snapshots/[0-9]+/snapshot' "$1" 2>/dev/null | head -n 1 || true
+  awk '
+    /^[[:space:]]*#/ {next}
+    NF < 2 {next}
+    tolower($1) ~ /^(linux(efi)?|options)$/ {
+      if (match($0, /\/\.snapshots\/[0-9]+\/snapshot/)) {
+        print substr($0, RSTART, RLENGTH)
+        exit
+      }
+    }
+  ' "$1" 2>/dev/null || true
 }
 
 snapshot_num_from_entry() {
   # Returns the snapshot number (digits only) if the entry references /.snapshots/<n>/snapshot
+  # Only consider real BLS lines (linux/linuxefi/options), not comments.
   local n
-  n="$(grep -Eo '/\.snapshots/[0-9]+/snapshot' "$1" 2>/dev/null | head -n 1 | grep -Eo '[0-9]+' || true)"
+  n="$(
+    awk '
+      /^[[:space:]]*#/ {next}
+      NF < 2 {next}
+      tolower($1) ~ /^(linux(efi)?|options)$/ {
+        if (match($0, /\/\.snapshots\/[0-9]+\/snapshot/)) {
+          s = substr($0, RSTART, RLENGTH)
+          gsub(/[^0-9]/, "", s)
+          print s
+          exit
+        }
+      }
+    ' "$1" 2>/dev/null
+  )"
   [[ -n "$n" ]] && printf '%s\n' "$n" || true
 }
 
@@ -930,10 +1066,32 @@ kernel_version_from_linux_path() {
 
 path_mentions_kver() {
   # Heuristic: if the linux path string contains the kernel version, treat it as a match.
+  # Must avoid substring false positives (e.g. 6.8.1 matching 6.8.10).
   local p="$1"
   local kver="$2"
   [[ -n "$p" && -n "$kver" ]] || return 1
-  [[ "$p" == *"$kver"* ]]
+
+  # Escape for bash regex (avoid sed/perl dependency here).
+  local kver_esc=""
+  local i ch
+  for (( i=0; i<${#kver}; i++ )); do
+    ch="${kver:$i:1}"
+    case "$ch" in
+      \\|.|^|\$|\||'?'|'*'|'+'|'('|')'|'{'|'}'|'['|']')
+        kver_esc+="\\$ch"
+        ;;
+      *)
+        kver_esc+="$ch"
+        ;;
+    esac
+  done
+
+  # Boundary rule: must not be preceded by a digit, and must be followed by a non-digit (or end).
+  # This prevents: "6.8.1" matching "6.8.10".
+  if [[ "$p" =~ (^|[^0-9])${kver_esc}([^0-9]|$) ]]; then
+    return 0
+  fi
+  return 1
 }
 
 modules_dir_exists_for_kver() {
@@ -1086,7 +1244,7 @@ maybe_temp_remount_rw_for_path() {
       REMOUNT_WAS_RO["$mp"]=1
       REMOUNTED_MOUNTPOINTS+=("$mp")
       trap restore_remounted_mountpoints EXIT
-      log "${C_DIM}remount:${C_RESET} $mp -> rw (${label})"
+      log "${C_DIM}remount:${C_RESET} $mp -> rw (${label}; path=$p)"
     else
       err "Could not remount $mp rw (needed for $label)"
       exit 1

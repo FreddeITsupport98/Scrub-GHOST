@@ -237,7 +237,10 @@ Remove hook:
 - **Corruption detection:** a kernel file that exists but is **0 bytes** is treated as broken (common when the ESP runs out of space).
 - **Auditing:** when the tool moves/deletes entries, it also writes best-effort audit lines to the system journal via `logger` (tag: `scrub-ghost`).
 - **Kernel version parsing:** the tool understands both sd-boot style paths (`/distro/<kver>/...`) and flat BLS/GRUB-style paths (`/vmlinuz-<kver>`). If it cannot confidently determine a kernel version, it will avoid classifying entries as `UNINSTALLED-KERNEL` (too risky) and will report that the modules check was skipped.
+- **Kernel protection matching:** protection checks avoid substring false positives (e.g. `6.8.1` will not accidentally match `6.8.10`).
+- **Latest installed kernel detection:** uses `sort -V` when available; otherwise falls back to a conservative bash numeric comparison so “latest kernel protection” still works in minimal/rescue shells. The fallback only considers module directory names that start with a numeric version (skips odd/unparsable names).
 - **Mountpoints with spaces:** mount detection decodes the `\040`-style escaping used in `/proc/mounts`, and mountpoint/options parsing uses a non-space delimiter so remount logic works even when mountpoints contain spaces.
+- **Snapshot detection:** snapshot numbers are extracted only from real BLS lines (`linux`/`linuxefi`/`options`), so snapshot-like strings in comments won’t accidentally protect an entry.
 - **Backup moves across filesystems:** when entries are moved to a backup directory on a different filesystem, the tool uses an explicit copy+verify+delete flow (instead of relying on non-atomic cross-device `mv`).
 - On read-only systems (MicroOS/Aeon), when applying changes the tool will try a temporary remount `rw` for the mountpoints containing the entries directory and backup root, then restore `ro` on exit. Disable this behavior with `--no-remount-rw`.
 - On MicroOS/Aeon, `/usr/local` may be read-only; use a transactional environment (e.g. `transactional-update shell`) for installs/integrations.
