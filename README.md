@@ -49,7 +49,7 @@ Smart behavior highlights:
 - Shows an **orphaned images** estimate (kernel/initrd files in `BOOT_DIR` that are not referenced by any current BLS entry).
 - Offers **Smart Repair** suggestions when it finds entries where the kernel exists but the initrd is missing/corrupt (suggested `dracut --force --kver ...`). These are reported as `ZOMBIE-INITRD` and are **not removed by default**. Smart Auto-Fix also offers a `REPAIR` action to run the required `dracut` commands for you.
 - Offers an **Active Healer** option to reinstall RPM-owned corrupt kernel packages (runs `zypper in -f ...` after confirmation).
-- Offers a **Vacuum advisor** to identify excess installed kernel packages (not running, not latest) and optionally remove them via `zypper rm ...`.
+- Offers a **Vacuum advisor** to identify excess installed kernel packages (not running, not latest) and optionally remove them via `zypper rm ...`. Vacuum respects pinning (pinned kernels are never suggested for removal).
 - Supports **pinning**: entries listed in `ENTRIES_DIR/.scrub-ghost-pinned` are never modified/pruned.
 - After applying a fix, it automatically **re-scans** to verify the counts dropped.
 - Duplicate detection uses a two-pass index so it keeps the “best” candidate automatically (prefers pinned/snapshot/kernel/default entries; otherwise keeps the newest mtime).

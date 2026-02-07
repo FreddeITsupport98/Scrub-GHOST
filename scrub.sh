@@ -2237,8 +2237,12 @@ is_pinned() {
   [[ -f "$pin_file" ]] || return 1
 
   local entry_name entry_id
-  entry_name="$(basename -- "$entry_file")"
-  entry_id="$(basename -- "$entry_file" .conf)"
+  entry_name=""
+  entry_id=""
+  if [[ -n "$entry_file" ]]; then
+    entry_name="$(basename -- "$entry_file")"
+    entry_id="$(basename -- "$entry_file" .conf)"
+  fi
 
   local pins
   pins="$(awk '
@@ -2258,6 +2262,52 @@ is_pinned() {
   if [[ -n "$entry_kver" ]] && printf '%s\n' "$pins" | grep -Fxq -- "$entry_kver"; then
     return 0
   fi
+
+  return 1
+}
+
+is_kver_pinned() {
+  local kver="$1"
+  [[ -n "$kver" ]] || return 1
+
+  local pin_file
+  pin_file="$(pinned_config_path)"
+  [[ -f "$pin_file" ]] || return 1
+
+  awk '
+    /^[[:space:]]*#/ {next}
+    NF==0 {next}
+    {gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print}
+  ' "$pin_file" 2>/dev/null | grep -Fxq -- "$kver"
+}
+
+kver_has_pinned_entry() {
+  # Returns 0 if any BLS entry matching this kver is pinned (by filename/id/kver).
+  local kver="$1"
+  [[ -n "$kver" ]] || return 1
+
+  # If the kver itself is pinned, that should block vacuum.
+  if is_kver_pinned "$kver"; then
+    return 0
+  fi
+
+  local f
+  for f in "$ENTRIES_DIR"/*.conf; do
+    [[ -e "$f" ]] || continue
+
+    local kp
+    kp="$(bls_linux_path "$f")"
+    [[ -n "$kp" ]] || continue
+
+    local kv
+    kv="$(kernel_version_from_linux_path "$kp" 2>/dev/null || true)"
+
+    if [[ -n "$kv" && "$kv" == "$kver" ]]; then
+      is_pinned "$f" "$kv" && return 0
+    elif path_mentions_kver "$kp" "$kver"; then
+      is_pinned "$f" "$kver" && return 0
+    fi
+  done
 
   return 1
 }
@@ -2362,6 +2412,11 @@ scan_excess_kernels() {
         continue
       fi
       if [[ -n "$lat_ver" && "$provides" == "$lat_ver" ]]; then
+        continue
+      fi
+
+      # Respect pinning: if this kernel version (or any matching entry) is pinned, never suggest removing it.
+      if kver_has_pinned_entry "$provides"; then
         continue
       fi
 
