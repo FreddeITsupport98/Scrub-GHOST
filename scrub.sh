@@ -2159,7 +2159,7 @@ menu_clean() {
   while true; do
     menu_header
     log "Clean (safe mode: moves entries to backup; creates backups first)"
-    log "0) Auto Fix (recommended)"
+    log "0) Smart Auto-Fix (recommended)"
     log "1) Prune stale Snapper entries"
     log "2) Remove ghosts only"
     log "3) Prune stale Snapper + uninstalled-kernel entries (requires YES)"
@@ -2660,7 +2660,7 @@ menu_main() {
   while true; do
     menu_header
     log "1) Scan (dry-run)"
-    log "2) Auto Fix (recommended)"
+    log "2) Smart Auto-Fix (recommended)"
     log "3) Clean (submenu)"
     log "4) Backups / Restore (submenu)"
     log "5) Settings (submenu)"
@@ -3368,8 +3368,23 @@ for entry in "$ENTRIES_DIR"/*.conf; do
       uninstalled_kernel_count=$((uninstalled_kernel_count + 1))
       log "${C_YELLOW}[UNINSTALLED-KERNEL]${C_RESET} $(basename -- "$entry") ${C_DIM}(modules missing for ${kver:-unknown})${C_RESET}"
 
+      # RPM awareness: if rpm says this kernel is installed, do NOT prune based on missing modules alone.
+      local rpm_says_installed=false
+      if [[ -n "$kver" ]] && command -v rpm >/dev/null 2>&1; then
+        if is_kernel_rpm_installed "$kver"; then
+          rpm_says_installed=true
+          log "        note:    ${C_BLUE}SKIP${C_RESET} (rpm reports kernel installed: kernel-uname-r=$kver)"
+        fi
+      fi
+
       if [[ "$PRUNE_UNINSTALLED_KERNELS" == true && "$CONFIRM_PRUNE_UNINSTALLED" == false ]]; then
         log "        note:    pruning requires --confirm-uninstalled (extra safety flag)"
+      fi
+
+      if [[ "$rpm_says_installed" == true ]]; then
+        protected_kernel_count=$((protected_kernel_count + 1))
+        json_add_result "$(basename -- "$entry")" "UNINSTALLED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${kver:-}" "SKIP" "rpm reports installed"
+        continue
       fi
 
       if [[ "$DRY_RUN" == true || "$PRUNE_UNINSTALLED_KERNELS" == false || "$CONFIRM_PRUNE_UNINSTALLED" == false ]]; then
