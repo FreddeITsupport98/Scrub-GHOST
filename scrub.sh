@@ -1,5 +1,30 @@
 #!/usr/bin/env bash
 
+# IMPORTANT: this script requires bash. Do not run it with `sh`.
+# (If invoked via `sh scrub.sh ...`, the shebang is bypassed and bash-specific syntax will break.)
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "ERROR: This script must be run with bash (not sh)." >&2
+  echo "Try: sudo bash $0 --menu" >&2
+  echo "Or:  chmod +x $0 && sudo ./$0 --menu" >&2
+  exit 2
+fi
+
+# If bash was invoked via the /bin/sh entrypoint (common on some distros), refuse.
+# Users should run via the shebang (./scrub.sh) or explicitly via bash.
+# This prevents subtle behavior differences and avoids confusing support cases.
+_bash_argv0="${BASH_ARGV0:-}"
+_bash_bin_base="$(basename "${BASH:-}" 2>/dev/null || true)"
+if [ "$_bash_argv0" = "sh" ] || [ "$_bash_bin_base" = "sh" ] || [ "$_bash_bin_base" = "dash" ]; then
+  echo "ERROR: Do not run via 'sh'. Use: sudo bash ./scrub.sh --menu (or make it executable and run ./scrub.sh)." >&2
+  exit 2
+fi
+
+# Stable script path for re-invoking ourselves from the menu.
+SCRIPT_SELF="${BASH_SOURCE[0]:-$0}"
+if command -v readlink >/dev/null 2>&1; then
+  SCRIPT_SELF="$(readlink -f -- "$SCRIPT_SELF" 2>/dev/null || printf '%s' "$SCRIPT_SELF")"
+fi
+
 # Safer BLS entry scrubber for openSUSE (Tumbleweed)
 # - Defaults to dry-run
 # - When forced, moves ghost entries to a backup directory (no hard delete)
@@ -95,6 +120,8 @@ Usage: scrub.sh [options]
 
 Scans Boot Loader Specification (BLS) entries under /boot/loader/entries and
 identifies "ghost" entries that reference a missing kernel image.
+
+NOTE: This script requires bash. Do not run it with `sh`.
 
 Default is DRY-RUN (no changes).
 
@@ -2011,12 +2038,12 @@ build_common_flags_minimal() {
 
 run_sub() {
   build_common_flags
-  SCRUB_GHOST_NO_MENU=1 bash "$0" --no-menu "${COMMON_FLAGS[@]}" "$@"
+  SCRUB_GHOST_NO_MENU=1 bash "$SCRIPT_SELF" --no-menu "${COMMON_FLAGS[@]}" "$@"
 }
 
 run_sub_minimal() {
   build_common_flags_minimal
-  SCRUB_GHOST_NO_MENU=1 bash "$0" --no-menu "${COMMON_FLAGS[@]}" "$@"
+  SCRUB_GHOST_NO_MENU=1 bash "$SCRIPT_SELF" --no-menu "${COMMON_FLAGS[@]}" "$@"
 }
 
 # --- SMART IMPROVEMENTS START ---
@@ -2706,7 +2733,7 @@ menu_auto_fix() {
     # 1) Silent dry-run analysis in JSON mode (no jq dependency)
     build_common_flags_minimal
     local json_output
-    json_output="$(SCRUB_GHOST_NO_MENU=1 bash "$0" --no-menu \
+    json_output="$(SCRUB_GHOST_NO_MENU=1 bash "$SCRIPT_SELF" --no-menu \
       --dry-run --json --no-color \
       --prune-duplicates --prune-stale-snapshots --prune-uninstalled \
       "${COMMON_FLAGS[@]}" --log-file /dev/null 2>/dev/null || true)"

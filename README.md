@@ -32,6 +32,9 @@ Not supported:
 Dry-run scan (recommended first):
 - `sudo ./scrub.sh --dry-run`
 
+Important:
+- This script requires **bash**. Do not run it with `sh` (use `sudo ./scrub.sh ...` or `sudo bash ./scrub.sh ...`).
+
 Interactive menu:
 - `sudo ./scrub.sh --menu`
 
@@ -270,6 +273,7 @@ Remove hook:
 
 ## Notes
 - **Argument validation:** unknown options (or options missing required values) will print an error and exit. Use `-h` or `--help` to see the full usage.
+- **Shell requirement:** the script must be executed by `bash` (the menu and CLI use bash arrays and other bash features). Running it via `sh` will fail.
 - **Pinning / manual overrides:** if `ENTRIES_DIR/.scrub-ghost-pinned` exists, any entry listed in it will be treated as `PINNED` and will never be moved/deleted. You can manage this file via the menu: `Settings -> Manage pinned entries`.
   You can pin by:
   - filename (e.g. `abcd.conf`)
