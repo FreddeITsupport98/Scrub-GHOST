@@ -333,6 +333,24 @@ log_audit() {
 
 json_escape() {
   local s="$1"
+
+  # Prefer a robust escaper if available (handles ASCII control chars 0x00-0x1F).
+  # This keeps --json output valid even if content contains unexpected control bytes.
+  if command -v perl >/dev/null 2>&1; then
+    # NOTE: bash strings can't contain NUL bytes; this still covers the control range
+    # that can realistically appear in filenames/config text.
+    printf '%s' "$s" | perl -pe '
+      s/\\/\\\\/g;
+      s/"/\\"/g;
+      s/\r/\\r/g;
+      s/\n/\\n/g;
+      s/\t/\\t/g;
+      s/([\x00-\x08\x0b\x0c\x0e-\x1f])/sprintf("\\u%04x", ord($1))/ge;
+    '
+    return 0
+  fi
+
+  # Fallback: common escapes only.
   s=${s//\\/\\\\}
   s=${s//"/\\"}
   s=${s//$'\n'/\\n}
@@ -785,25 +803,54 @@ snapshot_num_from_entry() {
 }
 
 kernel_version_from_linux_path() {
-  # openSUSE sdbootutil typically uses:
-  #   linux /opensuse-tumbleweed/<KVER>/linux-<hash>
-  # Return <KVER> if detectable.
+  # Best-effort kernel version extraction from a BLS "linux" path.
+  # Supports both:
+  # - sd-boot style (openSUSE): /distro/<KVER>/linux-<hash>
+  # - flat GRUB/BLS style:      /vmlinuz-<KVER>
   local p="$1"
   p="${p#/}"
-  local distro_seg="${p%%/*}"
+
+  # 1) Segment approach (sd-boot style): /<distro>/<kver>/<kernel>
   local rest="${p#*/}"
-
-  # Needs at least 2 segments
-  if [[ "$rest" == "$p" ]]; then
-    return 1
+  if [[ "$rest" != "$p" ]]; then
+    local kver="${rest%%/*}"
+    if [[ -n "$kver" && "$kver" != "$rest" ]]; then
+      printf '%s\n' "$kver"
+      return 0
+    fi
   fi
 
-  local kver="${rest%%/*}"
-  if [[ -n "$kver" && "$kver" != "$rest" ]]; then
-    printf '%s\n' "$kver"
-  else
-    return 1
+  # 2) Flat approach based on basename: vmlinuz-6.14.2-default, linux-6.8.1-...
+  local base="${p##*/}"
+  local cand=""
+  case "$base" in
+    vmlinuz-*) cand="${base#vmlinuz-}" ;;
+    linux-*)   cand="${base#linux-}" ;;
+    kernel-*)  cand="${base#kernel-}" ;;
+    bzImage-*) cand="${base#bzImage-}" ;;
+    *) cand="" ;;
+  esac
+
+  # Strip common suffixes when present.
+  cand="${cand%.efi}"
+  cand="${cand%.gz}"
+  cand="${cand%.xz}"
+
+  # Require at least one digit to avoid returning hashes like "linux-<hash>".
+  if [[ -n "$cand" && "$cand" =~ [0-9] ]]; then
+    printf '%s\n' "$cand"
+    return 0
   fi
+
+  return 1
+}
+
+path_mentions_kver() {
+  # Heuristic: if the linux path string contains the kernel version, treat it as a match.
+  local p="$1"
+  local kver="$2"
+  [[ -n "$p" && -n "$kver" ]] || return 1
+  [[ "$p" == *"$kver"* ]]
 }
 
 modules_dir_exists_for_kver() {
@@ -861,13 +908,19 @@ mount_info_for_path() {
   fi
 
   # Fallback: parse /proc/mounts and pick the longest matching mountpoint prefix.
+  # NOTE: /proc/mounts encodes spaces as octal escapes (e.g. \040). Decode for comparisons.
   local best_mp=""
   local best_opts=""
   while read -r dev mp fstype opts rest; do
     [[ -n "$mp" ]] || continue
-    if [[ "$p" == "$mp" || "$p" == "$mp"/* ]]; then
-      if [[ ${#mp} -gt ${#best_mp} ]]; then
-        best_mp="$mp"
+
+    # Decode octal escapes used in /proc/mounts.
+    local mp_dec
+    mp_dec="$(printf '%b' "$mp")"
+
+    if [[ "$p" == "$mp_dec" || "$p" == "$mp_dec"/* ]]; then
+      if [[ ${#mp_dec} -gt ${#best_mp} ]]; then
+        best_mp="$mp_dec"
         best_opts="$opts"
       fi
     fi
@@ -1684,6 +1737,14 @@ systemd_install_builtin() {
   local libexec_dir="/usr/local/libexec/scrub-ghost"
   local wrapper="$libexec_dir/run-systemd"
 
+  if [[ ! -w "/usr/local" ]]; then
+    err "/usr/local is not writable (likely a read-only root filesystem)."
+    if command -v transactional-update >/dev/null 2>&1; then
+      err "On MicroOS/Aeon, run installs inside a transactional update environment (e.g. 'transactional-update shell' then re-run)."
+    fi
+    return 1
+  fi
+
   mkdir -p -- "$libexec_dir"
 
   cat >"$wrapper" <<'EOF'
@@ -1776,6 +1837,14 @@ systemd_remove_builtin() {
 }
 
 zypp_install_builtin() {
+  if [[ ! -w "/usr/local" ]]; then
+    err "/usr/local is not writable (likely a read-only root filesystem)."
+    if command -v transactional-update >/dev/null 2>&1; then
+      err "On MicroOS/Aeon, run installs inside a transactional update environment (e.g. 'transactional-update shell' then re-run)."
+    fi
+    return 1
+  fi
+
   install -d -m 0755 -- /etc/zypp/commit.d
   cat >/etc/zypp/commit.d/50-scrub-ghost <<'EOF'
 #!/bin/sh
@@ -1880,7 +1949,16 @@ menu_install() {
           prompt_enter_to_continue
           continue
         fi
-        mkdir -p -- /usr/local/bin
+        mkdir -p -- /usr/local/bin 2>/dev/null || true
+        if [[ ! -w "/usr/local/bin" ]]; then
+          err "/usr/local/bin is not writable (likely a read-only root filesystem)."
+          if command -v transactional-update >/dev/null 2>&1; then
+            err "On MicroOS/Aeon, install via: transactional-update shell (then re-run this menu), or run the installer inside a transactional update."
+          fi
+          prompt_enter_to_continue
+          continue
+        fi
+
         install -m 0755 -- "$src" "$dest"
         log "Installed: $dest"
 
@@ -2348,6 +2426,54 @@ snapper_backup_snapshot() {
   fi
 }
 
+move_entry_to_backup_dir() {
+  # Moves $1 into $2, safely handling cross-filesystem moves.
+  # On EXDEV (e.g. ESP -> /var), "mv" becomes copy+delete; we do it explicitly with a temp file
+  # and a size check to reduce the chance of partial backups.
+  local src="$1"
+  local dest_dir="$2"
+
+  [[ -n "$src" && -n "$dest_dir" ]] || return 1
+
+  local base dest
+  base="$(basename -- "$src")"
+  dest="$dest_dir/$base"
+
+  # Avoid overwriting an existing file in the backup dir.
+  if [[ -e "$dest" ]]; then
+    dest="$dest_dir/$base.dup.$$"
+  fi
+
+  local src_dev dst_dev
+  src_dev="$(stat -c %d -- "$src" 2>/dev/null || true)"
+  dst_dev="$(stat -c %d -- "$dest_dir" 2>/dev/null || true)"
+
+  # Same filesystem => real rename is atomic.
+  if [[ -n "$src_dev" && -n "$dst_dev" && "$src_dev" == "$dst_dev" ]]; then
+    mv -- "$src" "$dest"
+    return 0
+  fi
+
+  # Cross-filesystem: copy to temp, fsync/sync best-effort, then rename into place, then delete original.
+  local tmp
+  tmp="$dest_dir/.scrub-ghost.tmp.$$.$base"
+
+  cp -p -- "$src" "$tmp" 2>/dev/null || cp -- "$src" "$tmp"
+  sync -f "$tmp" 2>/dev/null || sync 2>/dev/null || true
+
+  local a b
+  a="$(stat -c %s -- "$src" 2>/dev/null || true)"
+  b="$(stat -c %s -- "$tmp" 2>/dev/null || true)"
+  if [[ -n "$a" && -n "$b" && "$a" != "$b" ]]; then
+    err "Backup copy size mismatch for $src (src=$a tmp=$b); refusing to delete original"
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+
+  mv -f -- "$tmp" "$dest"
+  rm -f -- "$src"
+}
+
 # If applying changes, ensure writable mounts and create backups BEFORE touching entries.
 if [[ "$DRY_RUN" == false ]]; then
   maybe_temp_remount_rw_for_path "$ENTRIES_DIR" "entries dir"
@@ -2370,6 +2496,21 @@ fi
 for entry in "$ENTRIES_DIR"/*.conf; do
   [[ -e "$entry" ]] || continue
 
+  # Reset per-entry state to avoid leakage across iterations.
+  kernel_path=""
+  kernel_full=""
+  initrd_path=""
+  initrd_full=""
+  devicetree_path=""
+  devicetree_full=""
+  entry_kver=""
+  snap_num=""
+  snap_present=false
+  kver=""
+  modules_present=true
+  is_running_kernel=false
+  is_latest_kernel=false
+
   # Pull first linux/linuxefi path.
   kernel_path="$(bls_linux_path "$entry")"
 
@@ -2380,6 +2521,29 @@ for entry in "$ENTRIES_DIR"/*.conf; do
     continue
   fi
 
+  # Determine kernel version early so skip paths can still report it safely.
+  entry_kver="$(kernel_version_from_linux_path "$kernel_path" 2>/dev/null || true)"
+  kver="$entry_kver"
+
+  # Snapshot number early as well (avoid stale values in SKIPPED reports).
+  snap_num="$(snapshot_num_from_entry "$entry")"
+
+  # Guardrails: protect running/latest kernel even if we can't parse kver (string-match fallback).
+  if [[ -n "$RUNNING_KERNEL_VER" ]]; then
+    if [[ -n "$entry_kver" && "$entry_kver" == "$RUNNING_KERNEL_VER" ]]; then
+      is_running_kernel=true
+    elif path_mentions_kver "$kernel_path" "$RUNNING_KERNEL_VER"; then
+      is_running_kernel=true
+    fi
+  fi
+  if [[ -n "$LATEST_INSTALLED_VER" ]]; then
+    if [[ -n "$entry_kver" && "$entry_kver" == "$LATEST_INSTALLED_VER" ]]; then
+      is_latest_kernel=true
+    elif path_mentions_kver "$kernel_path" "$LATEST_INSTALLED_VER"; then
+      is_latest_kernel=true
+    fi
+  fi
+
   kernel_full="$(resolve_boot_path "$kernel_path" || true)"
   if [[ -z "$kernel_full" ]]; then
     warn "Skipping (could not resolve kernel path): $(basename -- "$entry")"
@@ -2388,20 +2552,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
     continue
   fi
 
-  # Determine kernel version from entry (used for safety guardrails)
-  entry_kver="$(kernel_version_from_linux_path "$kernel_path" 2>/dev/null || true)"
-  is_running_kernel=false
-  is_latest_kernel=false
-  if [[ -n "$entry_kver" && -n "$RUNNING_KERNEL_VER" && "$entry_kver" == "$RUNNING_KERNEL_VER" ]]; then
-    is_running_kernel=true
-  fi
-  if [[ -n "$entry_kver" && -n "$LATEST_INSTALLED_VER" && "$entry_kver" == "$LATEST_INSTALLED_VER" ]]; then
-    is_latest_kernel=true
-  fi
-
   # Snapshot verification/protection.
-  snap_num="$(snapshot_num_from_entry "$entry")"
-  snap_present=false
   if [[ "$VERIFY_SNAPSHOTS" == true && -n "$snap_num" ]]; then
     if snapshot_exists "$snap_num"; then
       snap_present=true
@@ -2416,14 +2567,15 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   fi
 
   # Kernel modules verification (helps detect entries for kernels not installed anymore)
-  kver=""
   modules_present=true
   if [[ "$VERIFY_KERNEL_MODULES" == true ]]; then
-    kver="$(kernel_version_from_linux_path "$kernel_path" 2>/dev/null || true)"
     if [[ -n "$kver" ]]; then
       if ! modules_dir_exists_for_kver "$kver"; then
         modules_present=false
       fi
+    else
+      # Unknown kver: do not classify as "uninstalled kernel" (too risky).
+      modules_present=true
     fi
   fi
 
@@ -2500,7 +2652,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
         else
           ensure_backup_dir
           log_audit "ACTION=MOVE file=$entry dest=$BACKUP_DIR reason=duplicate matches=${SEEN_PAYLOADS[$payload_sig]}"
-          mv -- "$entry" "$BACKUP_DIR/"
+          move_entry_to_backup_dir "$entry" "$BACKUP_DIR"
           moved_or_deleted_count=$((moved_or_deleted_count + 1))
           duplicate_pruned_count=$((duplicate_pruned_count + 1))
           json_add_result "$(basename -- "$entry")" "DUPLICATE" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "MOVE" "duplicate"
@@ -2541,7 +2693,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
       else
         ensure_backup_dir
         log_audit "ACTION=MOVE file=$entry dest=$BACKUP_DIR reason=stale-snapshot snapshot=${snap_num:-}"
-        mv -- "$entry" "$BACKUP_DIR/"
+        move_entry_to_backup_dir "$entry" "$BACKUP_DIR"
         json_add_result "$(basename -- "$entry")" "STALE-SNAPSHOT" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "MOVE" "stale snapshot"
       fi
       moved_or_deleted_count=$((moved_or_deleted_count + 1))
@@ -2576,7 +2728,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
       else
         ensure_backup_dir
         log_audit "ACTION=MOVE file=$entry dest=$BACKUP_DIR reason=uninstalled-kernel kver=${kver:-}"
-        mv -- "$entry" "$BACKUP_DIR/"
+        move_entry_to_backup_dir "$entry" "$BACKUP_DIR"
         json_add_result "$(basename -- "$entry")" "UNINSTALLED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${kver:-}" "MOVE" "uninstalled kernel"
       fi
       moved_or_deleted_count=$((moved_or_deleted_count + 1))
@@ -2693,7 +2845,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
     ensure_backup_dir
     log "        action:  moving entry file -> $BACKUP_DIR"
     log_audit "ACTION=MOVE file=$entry dest=$BACKUP_DIR reason=$status missing=${miss_list# }"
-    mv -- "$entry" "$BACKUP_DIR/"
+    move_entry_to_backup_dir "$entry" "$BACKUP_DIR"
     moved_or_deleted_count=$((moved_or_deleted_count + 1))
     json_add_result "$(basename -- "$entry")" "$status" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "MOVE" "missing:${miss_list}"
   fi

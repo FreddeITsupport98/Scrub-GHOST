@@ -125,7 +125,26 @@ if [[ "$UNINSTALL" == true ]]; then
   exit 0
 fi
 
-mkdir -p -- "$BIN_DIR"
+if ! mkdir -p -- "$BIN_DIR" 2>/dev/null; then
+  echo "ERROR: Cannot create install dir: $BIN_DIR (read-only filesystem?)" >&2
+  if command -v transactional-update >/dev/null 2>&1; then
+    echo "Hint (MicroOS/Aeon): run installs in a transactional environment, e.g.:" >&2
+    echo "  transactional-update shell" >&2
+    echo "  # then re-run: /path/to/install.sh" >&2
+  fi
+  exit 1
+fi
+
+if [[ ! -w "$BIN_DIR" ]]; then
+  echo "ERROR: Install dir is not writable: $BIN_DIR (read-only filesystem?)" >&2
+  if command -v transactional-update >/dev/null 2>&1; then
+    echo "Hint (MicroOS/Aeon): run installs in a transactional environment, e.g.:" >&2
+    echo "  transactional-update shell" >&2
+    echo "  # then re-run: /path/to/install.sh" >&2
+  fi
+  exit 1
+fi
+
 install -m 0755 -- "$SRC" "$DEST"
 
 echo "Installed: $DEST"
