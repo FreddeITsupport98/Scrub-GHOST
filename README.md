@@ -43,9 +43,10 @@ Recommended for most users:
 
 Smart behavior highlights:
 - Shows **boot storage health** (useful when /boot or ESP is full).
+- Shows an **orphaned images** estimate (kernel/initrd files in `BOOT_DIR` that are not referenced by any current BLS entry).
 - After applying a fix, it automatically **re-scans** to verify the counts dropped.
-- Duplicate detection uses a two-pass index so it keeps the “best” candidate automatically (prefers protected snapshot/kernel entries; otherwise keeps the newest mtime).
-- If a kernel image is detected as 0 bytes and it is owned by an RPM, the tool suggests a repair command (`zypper in -f <pkg>`).
+- Duplicate detection uses a two-pass index so it keeps the “best” candidate automatically (prefers protected snapshot/kernel/default entries; otherwise keeps the newest mtime).
+- If a kernel image is detected as corrupt (0 bytes **or** RPM checksum mismatch) and it is owned by an RPM, the tool suggests a repair command (`zypper in -f <pkg>`).
 
 Safe cleanup (moves entries to a backup directory; does not hard-delete):
 - `sudo ./scrub.sh --force --prune-stale-snapshots`
@@ -79,6 +80,8 @@ The tool contains multiple guardrails to avoid creating an unbootable state:
 - Running kernel & latest installed kernel protection:
   - the entry matching `uname -r` (running kernel) is protected
   - the entry matching the newest version seen under `/lib/modules` / `/usr/lib/modules` is also protected
+- Bootloader default protection (GRUB):
+  - if GRUB is in use and `grub2-editenv list` reports a `saved_entry`, the matching BLS entry is treated as protected
 - Restore validation:
   - restore is blocked unless the backup passes validation (unless you pass `--restore-anyway`)
 
@@ -258,7 +261,7 @@ Remove hook:
 ## Notes
 - Ghost/broken entry detection checks not only the `linux` path but also `initrd` (if present) and `devicetree` (if present). If any referenced file is missing, the entry is flagged as a ghost/broken entry. If an entry has multiple `initrd` lines, **all** initrds must exist.
 - **Quoted values:** BLS allows quoted values containing spaces (e.g. `linux "/EFI/My Folder/linux.efi"`). The parser supports this for path-like keys.
-- **Corruption detection:** a kernel file that exists but is **0 bytes** is treated as broken (common when the ESP runs out of space).
+- **Corruption detection:** a kernel file that exists but is **0 bytes** is treated as broken (common when the ESP runs out of space). If the kernel file is owned by an RPM package, the tool also runs a lightweight `rpm -Vf` check and flags **checksum mismatches** as corrupt (`CORRUPT-CSUM`).
 - **Auditing:** when the tool moves/deletes entries, it also writes best-effort audit lines to the system journal via `logger` (tag: `scrub-ghost`).
 - **Kernel version parsing:** the tool understands both sd-boot style paths (`/distro/<kver>/...`) and flat BLS/GRUB-style paths (`/vmlinuz-<kver>`). If it cannot confidently determine a kernel version, it will avoid classifying entries as `UNINSTALLED-KERNEL` (too risky) and will report that the modules check was skipped.
 - **Kernel protection matching:** protection checks avoid substring false positives (e.g. `6.8.1` will not accidentally match `6.8.10`).

@@ -552,6 +552,24 @@ payload_signature() {
 }
 
 # Kernel guardrails
+GRUB_DEFAULT_ID=""
+
+get_grub_default_id() {
+  # Best-effort: returns saved_entry from grubenv.
+  # On some setups this won't match BLS filenames; we only use exact matches.
+  if command -v grub2-editenv >/dev/null 2>&1; then
+    grub2-editenv list 2>/dev/null | awk -F= '$1=="saved_entry" {print $2; exit}' || true
+  fi
+}
+
+entry_is_grub_default() {
+  local entry_file="$1"
+  [[ -n "$entry_file" && -n "$GRUB_DEFAULT_ID" ]] || return 1
+  local base_id
+  base_id="$(basename -- "$entry_file" .conf)"
+  [[ "$base_id" == "$GRUB_DEFAULT_ID" ]]
+}
+
 kver_base_numeric() {
   # Extract leading numeric version part (e.g. "6.8.1" from "6.8.1-default").
   local v="$1"
@@ -724,6 +742,10 @@ compute_kernel_guardrails() {
   else
     LATEST_INSTALLED_VER="$modules_latest"
   fi
+
+  # Bootloader awareness: saved GRUB default (best effort)
+  GRUB_DEFAULT_ID="$(get_grub_default_id 2>/dev/null || true)"
+  [[ -n "$GRUB_DEFAULT_ID" ]] && debug "GRUB saved_entry: $GRUB_DEFAULT_ID"
 
   debug "Running kernel: ${RUNNING_KERNEL_VER:-unknown}"
   debug "Latest installed kernel: ${LATEST_INSTALLED_VER:-unknown}"
@@ -2031,6 +2053,77 @@ check_boot_storage_health() {
   fi
 }
 
+scan_orphaned_files() {
+  # Reports orphaned kernel-ish images under BOOT_DIR that are not referenced by any current BLS entry.
+  # Output: "None" or "<count> files (~<mb>MB)"
+  declare -A referenced
+
+  local f
+  for f in "$ENTRIES_DIR"/*.conf; do
+    [[ -e "$f" ]] || continue
+
+    local k
+    k="$(bls_linux_path "$f")"
+    [[ -n "$k" ]] && referenced["$(basename -- "$k")"]=1
+
+    declare -a ips
+    ips=()
+    mapfile -t ips < <(bls_initrd_paths "$f")
+    local ip
+    for ip in "${ips[@]}"; do
+      [[ -n "$ip" ]] && referenced["$(basename -- "$ip")"]=1
+    done
+
+    local dt
+    dt="$(bls_devicetree_path "$f")"
+    [[ -n "$dt" ]] && referenced["$(basename -- "$dt")"]=1
+  done
+
+  local orphan_count=0
+  local orphan_space=0
+
+  if command -v find >/dev/null 2>&1; then
+    local p
+    while IFS= read -r p; do
+      [[ -n "$p" && -f "$p" ]] || continue
+      local base
+      base="$(basename -- "$p")"
+      if [[ -z "${referenced[$base]+x}" ]]; then
+        orphan_count=$((orphan_count + 1))
+        local size
+        size="$(stat -c %s -- "$p" 2>/dev/null || echo 0)"
+        [[ "$size" =~ ^[0-9]+$ ]] || size=0
+        orphan_space=$((orphan_space + size))
+      fi
+    done < <(
+      find "$BOOT_DIR" -maxdepth 4 -type f \( \
+        -name 'vmlinuz-*' -o -name 'linux-*' -o -name 'initrd-*' -o -name 'initramfs-*' \
+      \) 2>/dev/null || true
+    )
+  else
+    local p
+    for p in "$BOOT_DIR"/vmlinuz-* "$BOOT_DIR"/linux-* "$BOOT_DIR"/initrd-* "$BOOT_DIR"/initramfs-*; do
+      [[ -e "$p" && -f "$p" ]] || continue
+      local base
+      base="$(basename -- "$p")"
+      if [[ -z "${referenced[$base]+x}" ]]; then
+        orphan_count=$((orphan_count + 1))
+        local size
+        size="$(stat -c %s -- "$p" 2>/dev/null || echo 0)"
+        [[ "$size" =~ ^[0-9]+$ ]] || size=0
+        orphan_space=$((orphan_space + size))
+      fi
+    done
+  fi
+
+  local mb=$(( orphan_space / 1024 / 1024 ))
+  if [[ "$orphan_count" -gt 0 ]]; then
+    printf '%s files (~%sMB)\n' "$orphan_count" "$mb"
+  else
+    printf 'None\n'
+  fi
+}
+
 json_summary_int() {
   # $1=json $2=key -> prints integer (or 0)
   local json="$1"
@@ -2088,13 +2181,21 @@ menu_auto_fix() {
     log "---------------------------------------------------"
     log " 0. Boot Storage:        $storage_status"
     log " 1. Ghost Entries:       $(recommend_action "$n_ghost" ghost)"
+    local orphans
+    orphans="$(scan_orphaned_files 2>/dev/null || printf 'None\n')"
+
     log " 2. Duplicate Entries:   $(recommend_action "$n_dupe" duplicate)"
     log " 3. Stale Snapshots:     $(recommend_action "$n_stale" stale)"
     log " 4. Uninstalled Kernels: $(recommend_action "$n_uninstall" uninstalled)"
+    log " 5. Orphaned Images:     ${C_YELLOW}${orphans}${C_RESET}"
     log "---------------------------------------------------"
 
     if [[ "$storage_rc" -eq 2 && "$n_uninstall" -gt 0 ]]; then
       warn "Boot storage is CRITICAL; consider option 'K' to prune uninstalled-kernel entries (aggressive)."
+    fi
+    if [[ "$orphans" != "None" ]]; then
+      log "${C_DIM}Tip: Orphaned images are files in BOOT_DIR with no menu entry.${C_RESET}"
+      log "${C_DIM}     To reclaim space, consider: ${C_BOLD}sudo zypper purge-kernels${C_RESET}${C_DIM} (review first).${C_RESET}"
     fi
 
     local total_safe total_issues
@@ -3046,11 +3147,17 @@ JSON_RESULTS=()
 
 compute_duplicate_protection_score() {
   # Prints a numeric score (higher = prefer keeping this entry).
+  # 3 = GRUB default (saved_entry matches BLS id)
   # 2 = protected snapshot
   # 1 = protected kernel (running/latest)
   # 0 = normal
   local entry_file="$1"
   local kernel_path="$2"
+
+  if entry_is_grub_default "$entry_file"; then
+    printf '3\n'
+    return 0
+  fi
 
   local snap_num snap_present
   snap_num="$(snapshot_num_from_entry "$entry_file")"
@@ -3317,6 +3424,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   modules_kver_unknown=false
   is_running_kernel=false
   is_latest_kernel=false
+  is_grub_default=false
 
   # Pull first linux/linuxefi path.
   kernel_path="$(bls_linux_path "$entry")"
@@ -3349,6 +3457,11 @@ for entry in "$ENTRIES_DIR"/*.conf; do
     elif path_mentions_kver "$kernel_path" "$LATEST_INSTALLED_VER"; then
       is_latest_kernel=true
     fi
+  fi
+
+  # Bootloader awareness: protect the saved GRUB default entry when it matches a BLS id.
+  if entry_is_grub_default "$entry"; then
+    is_grub_default=true
   fi
 
   kernel_full="$(resolve_boot_path "$kernel_path" || true)"
@@ -3428,11 +3541,38 @@ for entry in "$ENTRIES_DIR"/*.conf; do
 
   missing_kernel=false
   corrupt_kernel=false
+  corrupt_reason=""
   if [[ ! -e "$kernel_full" ]]; then
     missing_kernel=true
   elif [[ ! -s "$kernel_full" ]]; then
     corrupt_kernel=true
     missing_kernel=true
+    corrupt_reason="EMPTY"
+  else
+    # Deep integrity check (RPM): checksum mismatch means the kernel image on disk is not what
+    # the owning package shipped.
+    if command -v rpm >/dev/null 2>&1; then
+      local owners ver_out
+      owners="$(rpm -qf -- "$kernel_full" 2>/dev/null || true)"
+      if [[ -n "$owners" && "$owners" != *"not owned"* ]]; then
+        ver_out="$(rpm -Vf -- "$kernel_full" 2>/dev/null || true)"
+        if [[ -n "$ver_out" ]]; then
+          # rpm -V output uses '5' to indicate digest (checksum) mismatch.
+          while IFS= read -r _line; do
+            [[ -n "$_line" ]] || continue
+            local _flags _path
+            _flags="${_line%%[[:space:]]*}"
+            _path="$(awk '{print $NF}' <<<"$_line")"
+            if [[ "$_path" == "$kernel_full" && "$_flags" == *5* ]]; then
+              corrupt_kernel=true
+              missing_kernel=true
+              corrupt_reason="CSUM"
+              break
+            fi
+          done <<<"$ver_out"
+        fi
+      fi
+    fi
   fi
 
   # If nothing is missing, entry is potentially OK (then check duplicates / stale snapshot / uninstalled-kernel).
@@ -3468,9 +3608,9 @@ for entry in "$ENTRIES_DIR"/*.conf; do
           json_add_result "$(basename -- "$entry")" "DUPLICATE" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "protected snapshot entry"
           continue
         fi
-        if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true ]]; then
-          log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel)"
-          json_add_result "$(basename -- "$entry")" "DUPLICATE" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "protected kernel"
+        if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true || "$is_grub_default" == true ]]; then
+          log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel/default)"
+          json_add_result "$(basename -- "$entry")" "DUPLICATE" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "protected kernel/default"
           continue
         fi
 
@@ -3516,10 +3656,10 @@ for entry in "$ENTRIES_DIR"/*.conf; do
         continue
       fi
 
-      if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true ]]; then
-        log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel: ${entry_kver:-unknown})"
+      if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true || "$is_grub_default" == true ]]; then
+        log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel/default: ${entry_kver:-unknown})"
         protected_kernel_count=$((protected_kernel_count + 1))
-        json_add_result "$(basename -- "$entry")" "STALE-SNAPSHOT" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "protected kernel"
+        json_add_result "$(basename -- "$entry")" "STALE-SNAPSHOT" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "protected kernel/default"
         continue
       fi
 
@@ -3567,10 +3707,10 @@ for entry in "$ENTRIES_DIR"/*.conf; do
         continue
       fi
 
-      if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true ]]; then
-        log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel: ${entry_kver:-unknown})"
+      if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true || "$is_grub_default" == true ]]; then
+        log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel/default: ${entry_kver:-unknown})"
         protected_kernel_count=$((protected_kernel_count + 1))
-        json_add_result "$(basename -- "$entry")" "UNINSTALLED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${kver:-}" "SKIP" "protected kernel"
+        json_add_result "$(basename -- "$entry")" "UNINSTALLED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${kver:-}" "SKIP" "protected kernel/default"
         continue
       fi
 
@@ -3628,14 +3768,22 @@ for entry in "$ENTRIES_DIR"/*.conf; do
 
   log ""
   if [[ "${corrupt_kernel:-false}" == true ]]; then
+    local corrupt_desc
+    corrupt_desc="kernel file is corrupt"
+    if [[ "${corrupt_reason:-}" == "EMPTY" ]]; then
+      corrupt_desc="kernel file is 0 bytes"
+    elif [[ "${corrupt_reason:-}" == "CSUM" ]]; then
+      corrupt_desc="kernel file failed rpm checksum verification"
+    fi
+
     if [[ "$is_running_kernel" == true ]]; then
-      log "${C_RED}[CORRUPT-RUNNING]${C_RESET} $(basename -- "$entry") ${C_DIM}(kernel file is 0 bytes; running kernel: ${entry_kver:-unknown})${C_RESET}"
+      log "${C_RED}[CORRUPT-RUNNING]${C_RESET} $(basename -- "$entry") ${C_DIM}(${corrupt_desc}; running kernel: ${entry_kver:-unknown})${C_RESET}"
       critical_kernel_count=$((critical_kernel_count + 1))
     elif [[ "$is_latest_kernel" == true ]]; then
-      log "${C_RED}[CORRUPT-LATEST]${C_RESET} $(basename -- "$entry") ${C_DIM}(kernel file is 0 bytes; latest installed kernel: ${entry_kver:-unknown})${C_RESET}"
+      log "${C_RED}[CORRUPT-LATEST]${C_RESET} $(basename -- "$entry") ${C_DIM}(${corrupt_desc}; latest installed kernel: ${entry_kver:-unknown})${C_RESET}"
       protected_kernel_count=$((protected_kernel_count + 1))
     else
-      log "${C_RED}[CORRUPT]${C_RESET} $(basename -- "$entry") ${C_DIM}(kernel file is 0 bytes)${C_RESET}"
+      log "${C_RED}[CORRUPT]${C_RESET} $(basename -- "$entry") ${C_DIM}(${corrupt_desc})${C_RESET}"
     fi
 
     # Smart consistency check: if rpm owns this file, suggest a repair.
@@ -3643,7 +3791,11 @@ for entry in "$ENTRIES_DIR"/*.conf; do
       local owners
       owners="$(rpm -qf -- "$kernel_full" 2>/dev/null || true)"
       if [[ -n "$owners" && "$owners" != *"not owned"* ]]; then
-        log "        ${C_RED}CRITICAL:${C_RESET} owned by RPM package(s) but file is empty: $owners"
+        if [[ "${corrupt_reason:-}" == "EMPTY" ]]; then
+          log "        ${C_RED}CRITICAL:${C_RESET} owned by RPM package(s) but file is empty: $owners"
+        else
+          log "        ${C_RED}CRITICAL:${C_RESET} owned by RPM package(s) but file is corrupt: $owners"
+        fi
         log "        recommendation: sudo zypper in -f $owners"
       fi
     fi
@@ -3687,11 +3839,19 @@ for entry in "$ENTRIES_DIR"/*.conf; do
 
   if [[ "$DRY_RUN" == true ]]; then
     local status
-    status=$([[ "${corrupt_kernel:-false}" == true ]] && echo "CORRUPT" || echo "GHOST")
+    if [[ "${corrupt_kernel:-false}" == true ]]; then
+      if [[ "${corrupt_reason:-}" == "CSUM" ]]; then
+        status="CORRUPT-CSUM"
+      else
+        status="CORRUPT"
+      fi
+    else
+      status="GHOST"
+    fi
 
-    if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true ]]; then
-      log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel: ${entry_kver:-unknown})"
-      json_add_result "$(basename -- "$entry")" "PROTECTED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "$status (protected kernel)"
+    if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true || "$is_grub_default" == true ]]; then
+      log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel/default: ${entry_kver:-unknown})"
+      json_add_result "$(basename -- "$entry")" "PROTECTED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "$status (protected kernel/default)"
     else
       if [[ "$DELETE_MODE" == "delete" ]]; then
         log "        action:  (dry-run) would DELETE"
@@ -3704,15 +3864,23 @@ for entry in "$ENTRIES_DIR"/*.conf; do
     continue
   fi
 
-  if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true ]]; then
-    log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel: ${entry_kver:-unknown})"
+  if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true || "$is_grub_default" == true ]]; then
+    log "        action:  ${C_BLUE}SKIP${C_RESET} (protected kernel/default: ${entry_kver:-unknown})"
     protected_kernel_count=$((protected_kernel_count + 1))
-    json_add_result "$(basename -- "$entry")" "PROTECTED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "ghost/corrupt but protected kernel"
+    json_add_result "$(basename -- "$entry")" "PROTECTED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "SKIP" "ghost/corrupt but protected kernel/default"
     continue
   fi
 
   local status
-  status=$([[ "${corrupt_kernel:-false}" == true ]] && echo "CORRUPT" || echo "GHOST")
+  if [[ "${corrupt_kernel:-false}" == true ]]; then
+    if [[ "${corrupt_reason:-}" == "CSUM" ]]; then
+      status="CORRUPT-CSUM"
+    else
+      status="CORRUPT"
+    fi
+  else
+    status="GHOST"
+  fi
 
   if [[ "$DELETE_MODE" == "delete" ]]; then
     log "        action:  deleting entry file"
