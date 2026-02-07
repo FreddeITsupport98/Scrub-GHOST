@@ -3617,6 +3617,7 @@ menu_install() {
 
     local choice
     read -r -p "> " choice </dev/tty || return 0
+    debug "menu_main: choice='$choice'"
 
     case "$choice" in
       1)
@@ -3703,6 +3704,10 @@ menu_install() {
 }
 
 menu_main() {
+  # The interactive menu should never crash the whole script because a sub-command fails.
+  # `main()` runs with set -e; turn it off inside menu loops.
+  set +e
+
   while true; do
     menu_header
     log "1) Scan (dry-run)"
@@ -3722,7 +3727,11 @@ menu_main() {
     read -r -p "> " choice </dev/tty || return 0
 
     case "$choice" in
-      1) run_sub --dry-run; prompt_enter_to_continue ;;
+      1)
+        run_sub --dry-run
+        debug "menu_main: scan finished (LAST_SUBCOMMAND_RC=$LAST_SUBCOMMAND_RC)"
+        prompt_enter_to_continue
+        ;;
       2) menu_auto_fix ;;
       3) menu_clean ;;
       4) menu_backups ;;
