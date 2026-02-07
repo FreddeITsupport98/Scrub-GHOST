@@ -2038,12 +2038,36 @@ build_common_flags_minimal() {
 
 run_sub() {
   build_common_flags
+
+  # Menu runs with `set -e`; don't let a failed subcommand abort the whole menu.
+  local rc
+  set +e
   SCRUB_GHOST_NO_MENU=1 bash "$SCRIPT_SELF" --no-menu "${COMMON_FLAGS[@]}" "$@"
+  rc=$?
+  set -e
+
+  if [[ "$rc" -ne 0 ]]; then
+    err "Subcommand failed (exit=$rc). Run with --debug or check the log file for details."
+  fi
+
+  return $rc
 }
 
 run_sub_minimal() {
   build_common_flags_minimal
+
+  # Menu runs with `set -e`; don't let a failed subcommand abort the whole menu.
+  local rc
+  set +e
   SCRUB_GHOST_NO_MENU=1 bash "$SCRIPT_SELF" --no-menu "${COMMON_FLAGS[@]}" "$@"
+  rc=$?
+  set -e
+
+  if [[ "$rc" -ne 0 ]]; then
+    err "Subcommand failed (exit=$rc). Run with --debug or check the log file for details."
+  fi
+
+  return $rc
 }
 
 # --- SMART IMPROVEMENTS START ---
