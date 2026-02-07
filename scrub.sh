@@ -2283,6 +2283,98 @@ check_default_entry_health() {
   return 0
 }
 
+check_grub_freshness() {
+  # Returns 0 if Fresh, 1 if Stale (grub.cfg older than newest entry), 2 if Missing
+  # Output is a colored status string.
+  if [[ -z "${GRUB_CFG:-}" || ! -f "$GRUB_CFG" ]]; then
+    printf '%bMISSING%b' "$C_RED" "$C_RESET"
+    return 2
+  fi
+
+  local grub_mtime
+  grub_mtime="$(stat -c %Y -- "$GRUB_CFG" 2>/dev/null || echo 0)"
+  [[ "$grub_mtime" =~ ^[0-9]+$ ]] || grub_mtime=0
+
+  local newest_entry=0
+  local f
+  for f in "$ENTRIES_DIR"/*.conf; do
+    [[ -e "$f" ]] || continue
+    local tm
+    tm="$(stat -c %Y -- "$f" 2>/dev/null || echo 0)"
+    [[ "$tm" =~ ^[0-9]+$ ]] || tm=0
+    if (( tm > newest_entry )); then
+      newest_entry=$tm
+    fi
+  done
+
+  # Allow a small buffer for FS jitter.
+  if (( newest_entry > (grub_mtime + 5) )); then
+    printf '%bSTALE (Config older than entries)%b' "$C_YELLOW" "$C_RESET"
+    return 1
+  fi
+
+  printf '%bFRESH%b' "$C_GREEN" "$C_RESET"
+  return 0
+}
+
+scan_repairable_kvers() {
+  # Prints unique kernel versions that appear repairable via dracut.
+  local cmds
+  cmds="$(scan_repairable_entries 2>/dev/null || true)"
+  [[ -n "$cmds" ]] || return 0
+  # Expected format: "sudo dracut --force --kver <kver>"
+  printf '%s\n' "$cmds" | awk 'NF{print $NF}' | sort -u
+}
+
+scan_excess_kernels() {
+  # Prints installed kernel package NEVRAs that look safe to remove (capacity planning).
+  # Criteria: installed via RPM, NOT running, NOT the latest detected kernel.
+  command -v rpm >/dev/null 2>&1 || return 0
+
+  local run_ver
+  run_ver="${RUNNING_KERNEL_VER:-$(uname -r 2>/dev/null || true)}"
+  local lat_ver
+  lat_ver="${LATEST_INSTALLED_VER:-}"
+
+  # Consider common openSUSE kernel flavors.
+  declare -a base_pkgs
+  base_pkgs=(kernel-default kernel-preempt kernel-longterm)
+
+  declare -a excess
+  excess=()
+
+  local base
+  for base in "${base_pkgs[@]}"; do
+    rpm -q "$base" >/dev/null 2>&1 || continue
+
+    local nevra
+    while IFS= read -r nevra; do
+      [[ -n "$nevra" ]] || continue
+
+      # Try to map package -> kernel-uname-r provide.
+      local provides
+      provides="$(rpm -q --provides "$nevra" 2>/dev/null | awk '$1=="kernel-uname-r" && $2=="=" {print $3; exit}' || true)"
+
+      # If we can't determine the provide, skip (conservative).
+      [[ -n "$provides" ]] || continue
+
+      if [[ -n "$run_ver" && "$provides" == "$run_ver" ]]; then
+        continue
+      fi
+      if [[ -n "$lat_ver" && "$provides" == "$lat_ver" ]]; then
+        continue
+      fi
+
+      # Candidate for removal: pass NEVRA without arch when possible.
+      excess+=("$nevra")
+    done < <(rpm -q "$base" --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' 2>/dev/null || true)
+  done
+
+  if (( ${#excess[@]} > 0 )); then
+    printf '%s\n' "${excess[@]}" | sort -u
+  fi
+}
+
 find_entry_id_for_kver() {
   # $1=kver -> prints entry id (basename without .conf) of the first matching BLS entry.
   local kver="$1"
@@ -2476,6 +2568,11 @@ menu_auto_fix() {
     def_health="$(check_default_entry_health)"
     def_health_rc=$?
 
+    # 0d) Bootloader drift detection (grub.cfg freshness)
+    local grub_status grub_rc
+    grub_status="$(check_grub_freshness)"
+    grub_rc=$?
+
     # 1) Silent dry-run analysis in JSON mode (no jq dependency)
     build_common_flags_minimal
     local json_output
@@ -2498,7 +2595,8 @@ menu_auto_fix() {
     log " 0. Boot Storage:        $storage_status"
     log " 0. Boot Redundancy:     $redundancy_status"
     log " 0. Default Entry:       $def_health"
-    log " 1. Ghost Entries:       $(recommend_action "$n_ghost" ghost)"
+    log " 0. GRUB Config:         $grub_status"
+    log " 1. Ghost Entries:       $(recommend_action \"$n_ghost\" ghost)"
     log " 1b. Zombie Initrd:      $(recommend_action "$n_zombie" zombie)"
     local orphans
     orphans="$(scan_orphaned_files 2>/dev/null || printf 'None\n')"
@@ -2548,6 +2646,14 @@ menu_auto_fix() {
       corrupt_pkg_count="$(printf '%s\n' "$corrupt_pkg_list" | wc -l | tr -dc '0-9' || echo 0)"
     fi
 
+    # Vacuum advisor: identify excess (old but valid) kernel packages.
+    local excess_list excess_count
+    excess_list="$(scan_excess_kernels 2>/dev/null || true)"
+    excess_count=0
+    if [[ -n "$excess_list" ]]; then
+      excess_count="$(printf '%s\n' "$excess_list" | wc -l | tr -dc '0-9' || echo 0)"
+    fi
+
     local total_safe total_issues
     total_safe=$((n_ghost + n_dupe))
     total_issues=$((n_ghost + n_dupe + n_zombie + n_stale + n_uninstall))
@@ -2563,8 +2669,17 @@ menu_auto_fix() {
     if [[ "$def_health_rc" -eq 2 && -n "$LATEST_INSTALLED_VER" ]]; then
       log "  ${C_BOLD}SET-DEF${C_RESET}) Correct default entry (set to latest: $LATEST_INSTALLED_VER)"
     fi
+    if [[ "$grub_rc" -eq 1 ]]; then
+      log "  ${C_BOLD}UPDATE${C_RESET})  Update GRUB config (rebuild: grub2-mkconfig)"
+    fi
     if [[ "$corrupt_pkg_count" -gt 0 ]]; then
       log "  ${C_BOLD}HEAL${C_RESET})    Reinstall corrupt kernel packages ($corrupt_pkg_count)"
+    fi
+    if [[ -n "$repair_suggestions" ]]; then
+      log "  ${C_BOLD}REPAIR${C_RESET})  Resurrect zombie entries (run dracut)"
+    fi
+    if [[ "$excess_count" -gt 0 ]]; then
+      log "  ${C_BOLD}VACUUM${C_RESET})  Free disk space (remove $excess_count old kernel packages)"
     fi
     if [[ "$total_safe" -gt 0 ]]; then
       log "  ${C_BOLD}FIX${C_RESET})  Apply SAFE fixes only (Ghosts + Duplicates)"
@@ -2616,6 +2731,36 @@ menu_auto_fix() {
         continue
         ;;
 
+      UPDATE|update)
+        if [[ "$grub_rc" -ne 1 ]]; then
+          log "GRUB config looks fresh (nothing to update)."
+          prompt_enter_to_continue
+          continue
+        fi
+        if ! command -v grub2-mkconfig >/dev/null 2>&1; then
+          err "grub2-mkconfig not found."
+          prompt_enter_to_continue
+          continue
+        fi
+
+        log "About to run: grub2-mkconfig -o $GRUB_CFG"
+        log "Type YES to proceed:"
+        local yn
+        read -r -p "> " yn </dev/tty || true
+        if [[ "$yn" == "YES" ]]; then
+          maybe_temp_remount_rw_for_path "$GRUB_CFG" "grub.cfg"
+          if grub2-mkconfig -o "$GRUB_CFG"; then
+            log "${C_GREEN}Success!${C_RESET}"
+          else
+            err "Failed to update GRUB config."
+          fi
+        else
+          log "Cancelled."
+        fi
+        prompt_enter_to_continue
+        continue
+        ;;
+
       HEAL|heal)
         if [[ "$corrupt_pkg_count" -le 0 ]]; then
           log "No RPM-owned corrupt kernel packages detected."
@@ -2645,6 +2790,82 @@ menu_auto_fix() {
           if (( ${#pkgs[@]} > 0 )); then
             zypper -n in -f "${pkgs[@]}" || true
             log "Reinstall complete. Re-scanning..."
+            sleep 1
+            continue
+          fi
+        else
+          log "Cancelled."
+        fi
+
+        prompt_enter_to_continue
+        ;;
+
+      REPAIR|repair)
+        if [[ -z "$repair_suggestions" ]]; then
+          log "No repairable zombie entries found."
+          prompt_enter_to_continue
+          continue
+        fi
+        if ! command -v dracut >/dev/null 2>&1; then
+          err "dracut not found."
+          prompt_enter_to_continue
+          continue
+        fi
+
+        log "Starting automated initrd repair (dracut)..."
+        log "Type YES to proceed:"
+        local yn
+        read -r -p "> " yn </dev/tty || true
+        if [[ "$yn" != "YES" ]]; then
+          log "Cancelled."
+          prompt_enter_to_continue
+          continue
+        fi
+
+        local kver
+        while IFS= read -r kver; do
+          [[ -n "$kver" ]] || continue
+          log "Running: dracut --force --kver $kver"
+          if ! dracut --force --kver "$kver"; then
+            warn "dracut failed for kver=$kver"
+          fi
+        done < <(scan_repairable_kvers)
+
+        log "${C_GREEN}Repairs complete.${C_RESET} Re-scanning..."
+        sleep 1
+        continue
+        ;;
+
+      VACUUM|vacuum)
+        if [[ "$excess_count" -le 0 ]]; then
+          log "No excess kernel packages detected."
+          prompt_enter_to_continue
+          continue
+        fi
+        if ! command -v zypper >/dev/null 2>&1; then
+          err "zypper not found; cannot run vacuum."
+          prompt_enter_to_continue
+          continue
+        fi
+
+        log "${C_BOLD}Vacuum Advisor${C_RESET}"
+        log "The following kernel packages look removable (not running, not latest):"
+        while IFS= read -r p; do
+          [[ -n "$p" ]] || continue
+          log "  ${C_DIM}$p${C_RESET}"
+        done <<<"$excess_list"
+
+        log ""
+        log "Type RUN to execute removal now, or anything else to cancel:"
+        local yn
+        read -r -p "> " yn </dev/tty || true
+        if [[ "$yn" == "RUN" ]]; then
+          declare -a pkgs
+          pkgs=()
+          mapfile -t pkgs < <(printf '%s\n' "$excess_list" | awk 'NF{print}' | sort -u)
+          if (( ${#pkgs[@]} > 0 )); then
+            zypper -n rm "${pkgs[@]}" || true
+            log "Vacuum complete. Re-scanning..."
             sleep 1
             continue
           fi

@@ -45,9 +45,11 @@ Smart behavior highlights:
 - Shows **boot storage health** (useful when /boot or ESP is full).
 - Shows **boot redundancy** (how many unique kernel versions have at least one bootable BLS entry). If you only have 1, Smart Auto-Fix will require an extra confirmation.
 - Checks **GRUB default entry health** (saved_entry) and can fix a broken saved default by setting it to the latest detected kernel entry.
+- Checks **bootloader drift**: if `grub.cfg` is older than the newest BLS entry, it will show `STALE` and offers an `UPDATE` action (runs `grub2-mkconfig`).
 - Shows an **orphaned images** estimate (kernel/initrd files in `BOOT_DIR` that are not referenced by any current BLS entry).
-- Offers **Smart Repair** suggestions when it finds entries where the kernel exists but the initrd is missing/corrupt (suggested `dracut --force --kver ...`). These are reported as `ZOMBIE-INITRD` and are **not removed by default**.
+- Offers **Smart Repair** suggestions when it finds entries where the kernel exists but the initrd is missing/corrupt (suggested `dracut --force --kver ...`). These are reported as `ZOMBIE-INITRD` and are **not removed by default**. Smart Auto-Fix also offers a `REPAIR` action to run the required `dracut` commands for you.
 - Offers an **Active Healer** option to reinstall RPM-owned corrupt kernel packages (runs `zypper in -f ...` after confirmation).
+- Offers a **Vacuum advisor** to identify excess installed kernel packages (not running, not latest) and optionally remove them via `zypper rm ...`.
 - Supports **pinning**: entries listed in `ENTRIES_DIR/.scrub-ghost-pinned` are never modified/pruned.
 - After applying a fix, it automatically **re-scans** to verify the counts dropped.
 - Duplicate detection uses a two-pass index so it keeps the “best” candidate automatically (prefers pinned/snapshot/kernel/default entries; otherwise keeps the newest mtime).
