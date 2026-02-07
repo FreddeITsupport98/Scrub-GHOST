@@ -913,7 +913,9 @@ restore_entries_from_backup() {
   mkdir -p -- "$pre_dir"
 
   if compgen -G "$ENTRIES_DIR/*.conf" >/dev/null; then
-    cp -a -- "$ENTRIES_DIR"/*.conf "$pre_dir/" 2>/dev/null || cp -p -- "$ENTRIES_DIR"/*.conf "$pre_dir/"
+    cp -a -- "$ENTRIES_DIR"/*.conf "$pre_dir/" 2>/dev/null || \
+    cp -p -- "$ENTRIES_DIR"/*.conf "$pre_dir/" 2>/dev/null || \
+    cp -- "$ENTRIES_DIR"/*.conf "$pre_dir/"
   fi
 
   # Restore strategy:
@@ -978,7 +980,9 @@ restore_entries_from_backup() {
   for bf in "$src"/full/*.conf; do
     local base
     base="$(basename -- "$bf")"
-    cp -a -- "$bf" "$ENTRIES_DIR/$base" 2>/dev/null || cp -p -- "$bf" "$ENTRIES_DIR/$base"
+    cp -a -- "$bf" "$ENTRIES_DIR/$base" 2>/dev/null || \
+    cp -p -- "$bf" "$ENTRIES_DIR/$base" 2>/dev/null || \
+    cp -- "$bf" "$ENTRIES_DIR/$base"
   done
 
   # Apply clean-restore deletions (defensive: remove only entries that looked broken in the preview)
@@ -1333,13 +1337,19 @@ append_trap() {
 }
 
 scan_btrfs_partitions() {
+  # Backwards-compatible wrapper (older name). Prefer scan_linux_partitions.
+  scan_linux_partitions
+}
+
+scan_linux_partitions() {
   # Prints lines: "<dev> <fstype> <size> <uuid> <mountpoint>"
   # Example: /dev/nvme0n1p2 btrfs 100G 0123-... /mnt
   if ! command -v lsblk >/dev/null 2>&1; then
     return 1
   fi
 
-  lsblk -pnro NAME,FSTYPE,SIZE,UUID,MOUNTPOINT 2>/dev/null | awk '$2=="btrfs" {print}' || true
+  # Filter for common Linux filesystems to avoid listing swap/ESP.
+  lsblk -pnro NAME,FSTYPE,SIZE,UUID,MOUNTPOINT 2>/dev/null | awk '$2 ~ /^(btrfs|ext[34]|xfs)$/ {print}' || true
 }
 
 cleanup_rescue_mounts() {
@@ -1441,15 +1451,15 @@ menu_rescue_wizard() {
   log ""
 
   local -a lines
-  mapfile -t lines < <(scan_btrfs_partitions || true)
+  mapfile -t lines < <(scan_linux_partitions || true)
 
   if (( ${#lines[@]} == 0 )); then
-    warn "No btrfs partitions found via lsblk."
+    warn "No Linux filesystem partitions found via lsblk."
     warn "If your root is encrypted, unlock it first (e.g., cryptsetup open), then re-run." 
     return 1
   fi
 
-  log "Detected btrfs partitions:"
+  log "Detected Linux filesystem partitions:"
   local idx=1
   local line
   for line in "${lines[@]}"; do

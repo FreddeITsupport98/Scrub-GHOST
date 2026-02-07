@@ -147,6 +147,9 @@ Restore (validated):
 Restore options:
 - Additive restore is the default (does not delete newer entries).
 - `--clean-restore` will remove extra current entries not present in the backup.
+
+Restore copy behavior:
+- The restore path uses a best-effort copy strategy (try archive/preserve attributes; fall back to a plain copy) so restores work even when the entries directory is on FAT32 (ESP) and metadata preservation fails.
 - `--restore-anyway` bypasses failed restore validation.
 
 Backup rotation:
@@ -180,8 +183,8 @@ Start the wizard:
 - `sudo ./scrub.sh --rescue`
 
 The wizard:
-- scans for btrfs partitions via `lsblk`
-- mounts the selected device at `/mnt/scrub-ghost-rescue` (default btrfs subvolume)
+- scans for Linux filesystem partitions via `lsblk` (btrfs/ext3/ext4/xfs)
+- mounts the selected device at `/mnt/scrub-ghost-rescue` (default mount)
 - bind-mounts `/dev`, `/proc`, `/sys` (and best-effort `/run`)
 - runs `mount -a` inside the chroot (best effort) to mount `/boot`, `/boot/efi`, etc
 - injects and starts `scrub.sh --menu` inside the chroot
