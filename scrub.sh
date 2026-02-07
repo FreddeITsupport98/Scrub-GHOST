@@ -2040,42 +2040,55 @@ build_common_flags_minimal() {
 
 LAST_SUBCOMMAND_RC=0
 
+_restore_errexit() {
+  # $1 = had_errexit (0/1)
+  local had_errexit="$1"
+  if [[ "$had_errexit" -eq 1 ]]; then
+    set -e
+  else
+    set +e
+  fi
+}
+
 run_sub() {
   build_common_flags
 
-  # Menu runs with `set -e`; don't let a failed subcommand abort the whole menu.
+  # Menu runs with `set -e` in some code paths; never let a failed subcommand abort the menu.
+  local had_errexit=0
+  [[ "$-" == *e* ]] && had_errexit=1
+
   local rc
   set +e
   SCRUB_GHOST_NO_MENU=1 bash "$SCRIPT_SELF" --no-menu "${COMMON_FLAGS[@]}" "$@"
   rc=$?
-  set -e
+  _restore_errexit "$had_errexit"
 
   LAST_SUBCOMMAND_RC=$rc
 
   if [[ "$rc" -ne 0 ]]; then
     err "Subcommand failed (exit=$rc). Run with --debug or check the log file for details."
-    # IMPORTANT: do not propagate failure to the menu caller (set -e would terminate the menu).
-    return 0
   fi
 
+  # Always return success to callers in menu context.
   return 0
 }
 
 run_sub_minimal() {
   build_common_flags_minimal
 
-  # Menu runs with `set -e`; don't let a failed subcommand abort the whole menu.
+  local had_errexit=0
+  [[ "$-" == *e* ]] && had_errexit=1
+
   local rc
   set +e
   SCRUB_GHOST_NO_MENU=1 bash "$SCRIPT_SELF" --no-menu "${COMMON_FLAGS[@]}" "$@"
   rc=$?
-  set -e
+  _restore_errexit "$had_errexit"
 
   LAST_SUBCOMMAND_RC=$rc
 
   if [[ "$rc" -ne 0 ]]; then
     err "Subcommand failed (exit=$rc). Run with --debug or check the log file for details."
-    return 0
   fi
 
   return 0
@@ -2740,30 +2753,78 @@ menu_header() {
 }
 
 menu_auto_fix() {
+  # Smart Auto-Fix runs many "status" checks that intentionally return non-zero.
+  # Ensure the menu never exits due to `set -e`.
+  set +e
+
+  progress_init() {
+    PROGRESS_TOTAL="$1"
+    PROGRESS_CUR=0
+    PROGRESS_ACTIVE=false
+
+    # Only show progress when stdout is a TTY.
+    if [[ -t 1 ]]; then
+      PROGRESS_ACTIVE=true
+    fi
+  }
+
+  progress_tick() {
+    # $1 = label
+    local label="$1"
+    [[ "${PROGRESS_ACTIVE:-false}" == true ]] || return 0
+
+    PROGRESS_CUR=$((PROGRESS_CUR + 1))
+    local pct=$(( PROGRESS_CUR * 100 / PROGRESS_TOTAL ))
+
+    local width=24
+    local filled=$(( pct * width / 100 ))
+    local empty=$(( width - filled ))
+
+    local bar
+    bar="$(printf '%*s' "$filled" '' | tr ' ' '#')$(printf '%*s' "$empty" '' | tr ' ' '-')"
+
+    # Draw on its own line below the "Analyzing..." text.
+    printf '\r[%s] %3d%%  %s\033[K' "$bar" "$pct" "$label"
+
+    if [[ "$PROGRESS_CUR" -ge "$PROGRESS_TOTAL" ]]; then
+      printf '\n'
+    fi
+  }
+
   while true; do
     menu_header
     log "${C_BOLD}Smart Auto-Fix${C_RESET}"
     log "Analyzing system state..."
+    progress_init 10
+    progress_tick "Boot storage health"
 
     # 0) Context awareness: boot storage health
     local storage_status storage_rc
     storage_status="$(check_boot_storage_health)"
     storage_rc=$?
 
+    progress_tick "Kernel redundancy"
+
     # 0b) Sysadmin safety: kernel redundancy (spare tire check)
     local redundancy_status redundancy_rc
     redundancy_status="$(check_kernel_redundancy)"
     redundancy_rc=$?
+
+    progress_tick "Default entry health"
 
     # 0c) Sysadmin safety: GRUB default entry health (saved_entry)
     local def_health def_health_rc
     def_health="$(check_default_entry_health)"
     def_health_rc=$?
 
+    progress_tick "GRUB config freshness"
+
     # 0d) Bootloader drift detection (grub.cfg freshness)
     local grub_status grub_rc
     grub_status="$(check_grub_freshness)"
     grub_rc=$?
+
+    progress_tick "Dry-run JSON scan"
 
     # 1) Silent dry-run analysis in JSON mode (no jq dependency)
     build_common_flags_minimal
@@ -2772,6 +2833,8 @@ menu_auto_fix() {
       --dry-run --json --no-color \
       --prune-duplicates --prune-stale-snapshots --prune-uninstalled \
       "${COMMON_FLAGS[@]}" --log-file /dev/null 2>/dev/null || true)"
+
+    progress_tick "Parse counts"
 
     # 2) Parse summary integers
     local n_ghost n_zombie n_stale n_dupe n_uninstall
@@ -2790,6 +2853,8 @@ menu_auto_fix() {
     log " 0. GRUB Config:         $grub_status"
     log " 1. Ghost Entries:       $(recommend_action \"$n_ghost\" ghost)"
     log " 1b. Zombie Initrd:      $(recommend_action "$n_zombie" zombie)"
+    progress_tick "Scan orphaned images"
+
     local orphans
     orphans="$(scan_orphaned_files 2>/dev/null || printf 'None\n')"
 
@@ -2817,6 +2882,8 @@ menu_auto_fix() {
       log "${C_DIM}     To reclaim space, consider: ${C_BOLD}sudo zypper purge-kernels${C_RESET}${C_DIM} (review first).${C_RESET}"
     fi
 
+    progress_tick "Detect repairable zombies"
+
     # Mechanic advisor: propose repairs for entries with valid kernel but missing/corrupt initrd.
     local repair_suggestions
     repair_suggestions="$(scan_repairable_entries 2>/dev/null || true)"
@@ -2830,6 +2897,8 @@ menu_auto_fix() {
       done <<<"$repair_suggestions"
     fi
 
+    progress_tick "Scan corrupt kernel RPMs"
+
     # Active healer: find RPM packages that own corrupt kernel images.
     local corrupt_pkg_list corrupt_pkg_count
     corrupt_pkg_list="$(scan_corrupt_kernel_packages 2>/dev/null || true)"
@@ -2837,6 +2906,8 @@ menu_auto_fix() {
     if [[ -n "$corrupt_pkg_list" ]]; then
       corrupt_pkg_count="$(printf '%s\n' "$corrupt_pkg_list" | wc -l | tr -dc '0-9' || echo 0)"
     fi
+
+    progress_tick "Scan excess kernels"
 
     # Vacuum advisor: identify excess (old but valid) kernel packages.
     local excess_list excess_count

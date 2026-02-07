@@ -39,7 +39,7 @@ Interactive menu:
 - `sudo ./scrub.sh --menu`
 
 Recommended for most users:
-- Use the menu’s **Smart Auto-Fix** option. It performs a quiet analysis first (JSON-based), shows a scorecard (boot storage health + ghosts/duplicates/stale/uninstalled), then runs only the actions you choose.
+- Use the menu’s **Smart Auto-Fix** option. It performs a quiet analysis first (JSON-based), shows a scorecard (boot storage health + ghosts/duplicates/stale/uninstalled), and shows a small progress indicator while analysis is running. Then it runs only the actions you choose.
   - `FIX` applies safe fixes (ghosts + duplicates)
   - `ALL` includes stale snapshot pruning
   - `K` adds uninstalled-kernel pruning (aggressive; requires confirmation)
