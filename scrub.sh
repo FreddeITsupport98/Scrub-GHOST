@@ -2012,6 +2012,25 @@ recommend_action() {
   esac
 }
 
+check_boot_storage_health() {
+  # Get usage percentage of the filesystem holding $BOOT_DIR
+  local usage
+  usage="$(df --output=pcent "$BOOT_DIR" 2>/dev/null | tail -n 1 | tr -dc '0-9' || true)"
+
+  [[ -z "$usage" ]] && usage=0
+
+  if [[ "$usage" -ge 90 ]]; then
+    printf '%bCRITICAL (%s%%%%)%b' "$C_RED" "$usage" "$C_RESET"
+    return 2
+  elif [[ "$usage" -ge 75 ]]; then
+    printf '%bWARNING (%s%%%%)%b' "$C_YELLOW" "$usage" "$C_RESET"
+    return 1
+  else
+    printf '%bHEALTHY (%s%%%%)%b' "$C_GREEN" "$usage" "$C_RESET"
+    return 0
+  fi
+}
+
 json_summary_int() {
   # $1=json $2=key -> prints integer (or 0)
   local json="$1"
@@ -2044,13 +2063,18 @@ menu_auto_fix() {
     log "${C_BOLD}Smart Auto-Fix${C_RESET}"
     log "Analyzing system state..."
 
+    # 0) Context awareness: boot storage health
+    local storage_status storage_rc
+    storage_status="$(check_boot_storage_health)"
+    storage_rc=$?
+
     # 1) Silent dry-run analysis in JSON mode (no jq dependency)
     build_common_flags_minimal
     local json_output
     json_output="$(SCRUB_GHOST_NO_MENU=1 bash "$0" --no-menu \
-      --dry-run --json --no-color --log-file /dev/null \
+      --dry-run --json --no-color \
       --prune-duplicates --prune-stale-snapshots --prune-uninstalled \
-      "${COMMON_FLAGS[@]}" 2>/dev/null || true)"
+      "${COMMON_FLAGS[@]}" --log-file /dev/null 2>/dev/null || true)"
 
     # 2) Parse summary integers
     local n_ghost n_stale n_dupe n_uninstall
@@ -2062,11 +2086,16 @@ menu_auto_fix() {
     log ""
     log "${C_BOLD}Analysis Results & Recommendations:${C_RESET}"
     log "---------------------------------------------------"
+    log " 0. Boot Storage:        $storage_status"
     log " 1. Ghost Entries:       $(recommend_action "$n_ghost" ghost)"
     log " 2. Duplicate Entries:   $(recommend_action "$n_dupe" duplicate)"
     log " 3. Stale Snapshots:     $(recommend_action "$n_stale" stale)"
     log " 4. Uninstalled Kernels: $(recommend_action "$n_uninstall" uninstalled)"
     log "---------------------------------------------------"
+
+    if [[ "$storage_rc" -eq 2 && "$n_uninstall" -gt 0 ]]; then
+      warn "Boot storage is CRITICAL; consider option 'K' to prune uninstalled-kernel entries (aggressive)."
+    fi
 
     local total_safe total_issues
     total_safe=$((n_ghost + n_dupe))
@@ -2105,7 +2134,10 @@ menu_auto_fix() {
         [[ "$n_dupe" -gt 0 ]] && args+=(--prune-duplicates)
 
         run_sub_minimal "${args[@]}"
-        prompt_enter_to_continue
+        log ""
+        log "${C_BOLD}Verifying fixes...${C_RESET}"
+        sleep 1
+        continue
         ;;
 
       ALL|all|A|a)
@@ -2116,7 +2148,10 @@ menu_auto_fix() {
         [[ "$n_stale" -gt 0 ]] && args+=(--prune-stale-snapshots)
 
         run_sub_minimal "${args[@]}"
-        prompt_enter_to_continue
+        log ""
+        log "${C_BOLD}Verifying fixes...${C_RESET}"
+        sleep 1
+        continue
         ;;
 
       K|k)
@@ -2132,6 +2167,10 @@ menu_auto_fix() {
         read -r -p "> " yn </dev/tty || true
         if [[ "$yn" == "YES" ]]; then
           run_sub_minimal --force --prune-duplicates --prune-stale-snapshots --prune-uninstalled --confirm-uninstalled
+          log ""
+          log "${C_BOLD}Verifying fixes...${C_RESET}"
+          sleep 1
+          continue
         else
           log "Cancelled."
         fi
@@ -3283,10 +3322,27 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   payload_raw="${kernel_path}|${initrd_path}|${entry_options}"
   payload_sig="$(payload_signature "$payload_raw")"
 
+    local current_mtime stored_data stored_file stored_mtime
+    current_mtime="$(stat -c %Y -- "$entry" 2>/dev/null || echo 0)"
+
     if [[ -n "${SEEN_PAYLOADS[$payload_sig]+x}" ]]; then
+      stored_data="${SEEN_PAYLOADS[$payload_sig]}"
+
+      # Expected format: <fullpath>|<mtime>
+      if [[ "$stored_data" == *"|"* ]]; then
+        stored_file="${stored_data%%|*}"
+        stored_mtime="${stored_data#*|}"
+      else
+        stored_file="$stored_data"
+        stored_mtime=0
+      fi
+
       duplicate_found_count=$((duplicate_found_count + 1))
       log "${C_YELLOW}[DUPLICATE]${C_RESET} $(basename -- "$entry")"
-      log "        matches: ${SEEN_PAYLOADS[$payload_sig]}"
+      log "        matches: $(basename -- "$stored_file")"
+      if [[ "$current_mtime" =~ ^[0-9]+$ && "$stored_mtime" =~ ^[0-9]+$ && "$current_mtime" -gt "$stored_mtime" ]]; then
+        log "        ${C_YELLOW}NOTE:${C_RESET} current entry is newer than the one we are keeping (mtime $current_mtime > $stored_mtime)"
+      fi
 
       if [[ "$PRUNE_DUPLICATES" == true ]]; then
         if [[ "$snap_present" == true ]]; then
@@ -3308,14 +3364,14 @@ for entry in "$ENTRIES_DIR"/*.conf; do
 
         log "        action:  pruning duplicate"
         if [[ "$DELETE_MODE" == "delete" ]]; then
-          log_audit "ACTION=DELETE file=$entry reason=duplicate matches=${SEEN_PAYLOADS[$payload_sig]}"
+          log_audit "ACTION=DELETE file=$entry reason=duplicate matches=$(basename -- "$stored_file")"
           rm -f -- "$entry"
           moved_or_deleted_count=$((moved_or_deleted_count + 1))
           duplicate_pruned_count=$((duplicate_pruned_count + 1))
           json_add_result "$(basename -- "$entry")" "DUPLICATE" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "DELETE" "duplicate"
         else
           ensure_backup_dir
-          log_audit "ACTION=MOVE file=$entry dest=$BACKUP_DIR reason=duplicate matches=${SEEN_PAYLOADS[$payload_sig]}"
+          log_audit "ACTION=MOVE file=$entry dest=$BACKUP_DIR reason=duplicate matches=$(basename -- "$stored_file")"
           move_entry_to_backup_dir "$entry" "$BACKUP_DIR"
           moved_or_deleted_count=$((moved_or_deleted_count + 1))
           duplicate_pruned_count=$((duplicate_pruned_count + 1))
@@ -3328,7 +3384,8 @@ for entry in "$ENTRIES_DIR"/*.conf; do
       json_add_result "$(basename -- "$entry")" "DUPLICATE" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "NONE" "duplicate"
       continue
     else
-      SEEN_PAYLOADS["$payload_sig"]="$(basename -- "$entry")"
+      # Store full path + mtime for smarter duplicate warnings.
+      SEEN_PAYLOADS["$payload_sig"]="$entry|$current_mtime"
     fi
 
     # Kernel image exists, but we may still want to flag stale snapper/uninstalled kernels.
@@ -3461,6 +3518,16 @@ for entry in "$ENTRIES_DIR"/*.conf; do
       protected_kernel_count=$((protected_kernel_count + 1))
     else
       log "${C_RED}[CORRUPT]${C_RESET} $(basename -- "$entry") ${C_DIM}(kernel file is 0 bytes)${C_RESET}"
+    fi
+
+    # Smart consistency check: if rpm owns this file, suggest a repair.
+    if command -v rpm >/dev/null 2>&1; then
+      local owners
+      owners="$(rpm -qf -- "$kernel_full" 2>/dev/null || true)"
+      if [[ -n "$owners" && "$owners" != *"not owned"* ]]; then
+        log "        ${C_RED}CRITICAL:${C_RESET} owned by RPM package(s) but file is empty: $owners"
+        log "        recommendation: sudo zypper in -f $owners"
+      fi
     fi
   elif [[ "$is_running_kernel" == true ]]; then
     log "${C_RED}[CRITICAL-GHOST]${C_RESET} $(basename -- "$entry") ${C_DIM}(running kernel: ${entry_kver:-unknown})${C_RESET}"

@@ -36,10 +36,16 @@ Interactive menu:
 - `sudo ./scrub.sh --menu`
 
 Recommended for most users:
-- Use the menu’s **Smart Auto-Fix** option. It performs a quiet analysis first (JSON-based), shows a scorecard (ghosts/duplicates/stale/uninstalled), then runs only the actions you choose.
+- Use the menu’s **Smart Auto-Fix** option. It performs a quiet analysis first (JSON-based), shows a scorecard (boot storage health + ghosts/duplicates/stale/uninstalled), then runs only the actions you choose.
   - `FIX` applies safe fixes (ghosts + duplicates)
   - `ALL` includes stale snapshot pruning
   - `K` adds uninstalled-kernel pruning (aggressive; requires confirmation)
+
+Smart behavior highlights:
+- Shows **boot storage health** (useful when /boot or ESP is full).
+- After applying a fix, it automatically **re-scans** to verify the counts dropped.
+- Duplicate detection stores mtimes and warns when the “duplicate” entry is actually newer.
+- If a kernel image is detected as 0 bytes and it is owned by an RPM, the tool suggests a repair command (`zypper in -f <pkg>`).
 
 Safe cleanup (moves entries to a backup directory; does not hard-delete):
 - `sudo ./scrub.sh --force --prune-stale-snapshots`
