@@ -1953,8 +1953,10 @@ if [[ "$VERIFY_SNAPSHOTS" == true ]]; then
 fi
 
 prompt_enter_to_continue() {
+  # Intentionally show the prompt via log(), since `read -p` prints to stderr and can be hidden.
+  log "${C_DIM}Press Enter to continue...${C_RESET}"
   # shellcheck disable=SC2162
-  read -r -p "Press Enter to continue..." _ </dev/tty 2>/dev/null || true
+  read -r _ </dev/tty 2>/dev/null || true
 }
 
 build_common_flags() {
@@ -3617,6 +3619,14 @@ menu_install() {
 
     local choice
     read -r -p "> " choice </dev/tty || return 0
+
+    # Ignore empty/whitespace-only input (common when the user just pressed Enter to continue).
+    choice="${choice//$'\r'/}"
+    if [[ -z "${choice//[[:space:]]/}" ]]; then
+      continue
+    fi
+    choice="${choice//[[:space:]]/}"
+
     debug "menu_main: choice='$choice'"
 
     case "$choice" in
@@ -3742,7 +3752,7 @@ menu_main() {
       9) menu_completion ;;
       10) menu_rescue_wizard ; prompt_enter_to_continue ;;
       0) return 0 ;;
-      *) log "Invalid option."; prompt_enter_to_continue ;;
+      *) log "Invalid option: '$choice'."; prompt_enter_to_continue ;;
     esac
   done
 }
