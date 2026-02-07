@@ -1806,8 +1806,48 @@ build_common_flags() {
   [[ "$BOOT_DIR_SET" == true ]] && COMMON_FLAGS+=("--boot-dir" "$BOOT_DIR")
 }
 
+build_common_flags_minimal() {
+  # Common flags for menu automation that should NOT depend on pruning toggles.
+  # (Advanced users can still enable pruning via the existing clean submenu/settings.)
+  COMMON_FLAGS=()
+
+  [[ "$COLOR" == false ]] && COMMON_FLAGS+=("--no-color")
+  [[ "$VERBOSE" == true ]] && COMMON_FLAGS+=("--verbose")
+  [[ "$DEBUG" == true ]] && COMMON_FLAGS+=("--debug")
+
+  if [[ -n "$LOG_FILE" ]]; then
+    COMMON_FLAGS+=("--log-file" "$LOG_FILE")
+  fi
+
+  [[ "$REBUILD_GRUB" == true ]] && COMMON_FLAGS+=("--rebuild-grub")
+  [[ "$UPDATE_SDBOOT" == true ]] && COMMON_FLAGS+=("--update-sdboot")
+  [[ "$AUTO_REMOUNT_RW" == false ]] && COMMON_FLAGS+=("--no-remount-rw")
+  if [[ "$GRUB_CFG_SET" == true ]]; then
+    COMMON_FLAGS+=("--grub-cfg" "$GRUB_CFG")
+  fi
+
+  [[ "$AUTO_BACKUP" == false ]] && COMMON_FLAGS+=("--no-backup")
+  [[ "$AUTO_SNAPPER_BACKUP" == false ]] && COMMON_FLAGS+=("--no-snapper-backup")
+
+  [[ "$VERIFY_SNAPSHOTS" == false ]] && COMMON_FLAGS+=("--no-verify-snapshots")
+  [[ "$VERIFY_KERNEL_MODULES" == false ]] && COMMON_FLAGS+=("--no-verify-modules")
+
+  [[ -n "$BACKUP_ROOT" ]] && COMMON_FLAGS+=("--backup-root" "$BACKUP_ROOT")
+  [[ -n "$KEEP_BACKUPS" ]] && COMMON_FLAGS+=("--keep-backups" "$KEEP_BACKUPS")
+
+  [[ "$BACKUP_DIR_SET" == true ]] && COMMON_FLAGS+=("--backup-dir" "$BACKUP_DIR")
+
+  [[ "$ENTRIES_DIR_SET" == true ]] && COMMON_FLAGS+=("--entries-dir" "$ENTRIES_DIR")
+  [[ "$BOOT_DIR_SET" == true ]] && COMMON_FLAGS+=("--boot-dir" "$BOOT_DIR")
+}
+
 run_sub() {
   build_common_flags
+  SCRUB_GHOST_NO_MENU=1 bash "$0" --no-menu "${COMMON_FLAGS[@]}" "$@"
+}
+
+run_sub_minimal() {
+  build_common_flags_minimal
   SCRUB_GHOST_NO_MENU=1 bash "$0" --no-menu "${COMMON_FLAGS[@]}" "$@"
 }
 
@@ -1821,10 +1861,58 @@ menu_header() {
   log ""
 }
 
+menu_auto_fix() {
+  while true; do
+    menu_header
+    log "${C_BOLD}Auto Fix (recommended)${C_RESET}"
+    log "Runs a safe, opinionated cleanup flow (does not depend on menu settings):"
+    log "- dry-run scan with stale-snapshot + duplicate analysis"
+    log "- then (if confirmed) apply: move ghosts + prune stale snapshots + prune duplicates"
+    log ""
+
+    log "Step 1/2: preview (dry-run)"
+    run_sub_minimal --dry-run --prune-stale-snapshots --prune-duplicates
+
+    log ""
+    log "Type FIX to apply the recommended cleanup (safe move + backups):"
+    log "(or type 'u' to also prune uninstalled-kernel entries; requires extra confirmation)"
+    log "(or type 'b' to go back)"
+
+    local choice
+    read -r -p "> " choice </dev/tty || return 0
+
+    case "$choice" in
+      b|back)
+        return 0
+        ;;
+      u|U)
+        log "Type YES to also prune uninstalled-kernel entries:";
+        local yn
+        read -r -p "> " yn </dev/tty || true
+        if [[ "$yn" == "YES" ]]; then
+          run_sub_minimal --force --prune-stale-snapshots --prune-duplicates --prune-uninstalled --confirm-uninstalled
+        else
+          log "Cancelled uninstalled-kernel pruning."
+        fi
+        prompt_enter_to_continue
+        ;;
+      FIX)
+        run_sub_minimal --force --prune-stale-snapshots --prune-duplicates
+        prompt_enter_to_continue
+        ;;
+      *)
+        log "Cancelled."
+        prompt_enter_to_continue
+        ;;
+    esac
+  done
+}
+
 menu_clean() {
   while true; do
     menu_header
     log "Clean (safe mode: moves entries to backup; creates backups first)"
+    log "0) Auto Fix (recommended)"
     log "1) Prune stale Snapper entries"
     log "2) Remove ghosts only"
     log "3) Prune stale Snapper + uninstalled-kernel entries (requires YES)"
@@ -1836,6 +1924,9 @@ menu_clean() {
     read -r -p "> " choice </dev/tty || return 0
 
     case "$choice" in
+      0)
+        menu_auto_fix
+        ;;
       1)
         run_sub --force --prune-stale-snapshots
         prompt_enter_to_continue
@@ -2322,14 +2413,15 @@ menu_main() {
   while true; do
     menu_header
     log "1) Scan (dry-run)"
-    log "2) Clean (submenu)"
-    log "3) Backups / Restore (submenu)"
-    log "4) Settings (submenu)"
-    log "5) Paths / advanced (submenu)"
-    log "6) Danger zone (submenu)"
-    log "7) Install / uninstall (command only)"
-    log "8) Completion (submenu)"
-    log "9) Rescue / chroot wizard (Live ISO)"
+    log "2) Auto Fix (recommended)"
+    log "3) Clean (submenu)"
+    log "4) Backups / Restore (submenu)"
+    log "5) Settings (submenu)"
+    log "6) Paths / advanced (submenu)"
+    log "7) Danger zone (submenu)"
+    log "8) Install / uninstall (command only)"
+    log "9) Completion (submenu)"
+    log "10) Rescue / chroot wizard (Live ISO)"
     log "0) Exit"
     log ""
 
@@ -2338,14 +2430,15 @@ menu_main() {
 
     case "$choice" in
       1) run_sub --dry-run; prompt_enter_to_continue ;;
-      2) menu_clean ;;
-      3) menu_backups ;;
-      4) menu_settings ;;
-      5) menu_paths ;;
-      6) menu_danger ;;
-      7) menu_install ;;
-      8) menu_completion ;;
-      9) menu_rescue_wizard ; prompt_enter_to_continue ;;
+      2) menu_auto_fix ;;
+      3) menu_clean ;;
+      4) menu_backups ;;
+      5) menu_settings ;;
+      6) menu_paths ;;
+      7) menu_danger ;;
+      8) menu_install ;;
+      9) menu_completion ;;
+      10) menu_rescue_wizard ; prompt_enter_to_continue ;;
       0) return 0 ;;
       *) log "Invalid option."; prompt_enter_to_continue ;;
     esac
