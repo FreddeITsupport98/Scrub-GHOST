@@ -36,7 +36,10 @@ Interactive menu:
 - `sudo ./scrub.sh --menu`
 
 Recommended for most users:
-- Use the menu’s **Auto Fix (recommended)** option. It runs a dry-run preview and then (only if you type `FIX`) applies a safe cleanup (move ghosts to backup + prune stale snapshots + prune duplicates).
+- Use the menu’s **Smart Auto-Fix** option. It performs a quiet analysis first (JSON-based), shows a scorecard (ghosts/duplicates/stale/uninstalled), then runs only the actions you choose.
+  - `FIX` applies safe fixes (ghosts + duplicates)
+  - `ALL` includes stale snapshot pruning
+  - `K` adds uninstalled-kernel pruning (aggressive; requires confirmation)
 
 Safe cleanup (moves entries to a backup directory; does not hard-delete):
 - `sudo ./scrub.sh --force --prune-stale-snapshots`

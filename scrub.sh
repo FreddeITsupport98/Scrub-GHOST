@@ -618,8 +618,48 @@ kver_is_newer() {
   return 1
 }
 
+rpm_kernel_uname_r_candidates() {
+  # Prints candidate kernel-uname-r values from RPM provides, one per line.
+  # Example output: 6.8.1-1-default
+  command -v rpm >/dev/null 2>&1 || return 1
+
+  local pkg
+  for pkg in kernel-default kernel-preempt kernel-longterm; do
+    rpm -q "$pkg" >/dev/null 2>&1 || continue
+
+    # Example line: kernel-uname-r = 6.8.1-1-default
+    rpm -q --provides "$pkg" 2>/dev/null | awk '
+      $1=="kernel-uname-r" && $2=="=" {print $3}
+    ' || true
+  done
+}
+
 compute_kernel_guardrails() {
   RUNNING_KERNEL_VER="$(uname -r 2>/dev/null || true)"
+
+  local rpm_latest=""
+  if command -v rpm >/dev/null 2>&1; then
+    local cand
+    while IFS= read -r cand; do
+      [[ -n "$cand" ]] || continue
+      if ! kver_base_numeric "$cand" >/dev/null 2>&1; then
+        continue
+      fi
+      if [[ -z "$rpm_latest" ]]; then
+        rpm_latest="$cand"
+      else
+        if kver_is_newer "$cand" "$rpm_latest"; then
+          rpm_latest="$cand"
+        fi
+      fi
+    done < <(rpm_kernel_uname_r_candidates 2>/dev/null || true)
+
+    # Only accept RPM-derived "latest" if it actually has modules present.
+    if [[ -n "$rpm_latest" ]] && ! modules_dir_exists_for_kver "$rpm_latest"; then
+      debug "RPM latest candidate has no modules dir; ignoring: $rpm_latest"
+      rpm_latest=""
+    fi
+  fi
 
   # Prefer modules list (more reliable on sd-boot setups than vmlinuz-* in /boot)
   # Portability: sort -V is a GNU extension; in minimal/rescue environments it may not exist.
@@ -628,8 +668,9 @@ compute_kernel_guardrails() {
     have_sort_v=true
   fi
 
+  local modules_latest=""
   if [[ "$have_sort_v" == true ]]; then
-    LATEST_INSTALLED_VER="$(
+    modules_latest="$(
       {
         ls -1 /lib/modules 2>/dev/null || true
         ls -1 /usr/lib/modules 2>/dev/null || true
@@ -667,8 +708,21 @@ compute_kernel_guardrails() {
       debug "latest-kernel fallback: no parseable module dirs found; using running kernel as latest: $max_ver"
     fi
 
-    LATEST_INSTALLED_VER="$max_ver"
-    debug "sort -V not available; using bash fallback latest-installed-kernel detection: ${LATEST_INSTALLED_VER:-unknown}"
+    modules_latest="$max_ver"
+    debug "sort -V not available; using bash fallback latest-installed-kernel detection: ${modules_latest:-unknown}"
+  fi
+
+  # Choose best candidate (RPM-aware if available).
+  if [[ -n "$rpm_latest" && -n "$modules_latest" ]]; then
+    if kver_is_newer "$rpm_latest" "$modules_latest"; then
+      LATEST_INSTALLED_VER="$rpm_latest"
+    else
+      LATEST_INSTALLED_VER="$modules_latest"
+    fi
+  elif [[ -n "$rpm_latest" ]]; then
+    LATEST_INSTALLED_VER="$rpm_latest"
+  else
+    LATEST_INSTALLED_VER="$modules_latest"
   fi
 
   debug "Running kernel: ${RUNNING_KERNEL_VER:-unknown}"
@@ -1908,6 +1962,72 @@ run_sub_minimal() {
   SCRUB_GHOST_NO_MENU=1 bash "$0" --no-menu "${COMMON_FLAGS[@]}" "$@"
 }
 
+# --- SMART IMPROVEMENTS START ---
+
+is_kernel_rpm_installed() {
+  local kver="$1"
+  [[ -n "$kver" ]] || return 1
+
+  # If rpm command exists, check the database via kernel-uname-r provide.
+  if command -v rpm >/dev/null 2>&1; then
+    if rpm -q --whatprovides "kernel-uname-r = $kver" >/dev/null 2>&1; then
+      return 0
+    fi
+    return 1
+  fi
+
+  # Fallback: if no rpm command, assume installed (conservative)
+  return 0
+}
+
+recommend_action() {
+  local count="$1"
+  local type="$2"
+
+  if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+    count=0
+  fi
+
+  if [[ "$count" -eq 0 ]]; then
+    printf '%bNone found%b' "$C_GREEN" "$C_RESET"
+    return 0
+  fi
+
+  case "$type" in
+    ghost)
+      printf '%b%d found%b -> %bClean (Safe)%b' "$C_RED" "$count" "$C_RESET" "$C_BOLD" "$C_RESET"
+      ;;
+    duplicate)
+      printf '%b%d found%b -> %bPrune (Safe)%b' "$C_YELLOW" "$count" "$C_RESET" "$C_BOLD" "$C_RESET"
+      ;;
+    stale)
+      printf '%b%d found%b -> %bKeep (Manual review suggested)%b' "$C_YELLOW" "$count" "$C_RESET" "$C_DIM" "$C_RESET"
+      ;;
+    uninstalled)
+      printf '%b%d found%b -> %bKeep (Requires confirmation)%b' "$C_YELLOW" "$count" "$C_RESET" "$C_DIM" "$C_RESET"
+      ;;
+    *)
+      printf '%d' "$count"
+      ;;
+  esac
+}
+
+json_summary_int() {
+  # $1=json $2=key -> prints integer (or 0)
+  local json="$1"
+  local key="$2"
+
+  local v
+  v="$(printf '%s' "$json" | grep -o "\"$key\":[0-9]\+" 2>/dev/null | head -n 1 | cut -d: -f2 || true)"
+  if [[ "$v" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$v"
+  else
+    printf '0\n'
+  fi
+}
+
+# --- SMART IMPROVEMENTS END ---
+
 menu_header() {
   log ""
   log "${C_BOLD}scrub-ghost interactive menu${C_RESET}"
@@ -1921,44 +2041,114 @@ menu_header() {
 menu_auto_fix() {
   while true; do
     menu_header
-    log "${C_BOLD}Auto Fix (recommended)${C_RESET}"
-    log "Runs a safe, opinionated cleanup flow (does not depend on menu settings):"
-    log "- dry-run scan with stale-snapshot + duplicate analysis"
-    log "- then (if confirmed) apply: move ghosts + prune stale snapshots + prune duplicates"
-    log ""
+    log "${C_BOLD}Smart Auto-Fix${C_RESET}"
+    log "Analyzing system state..."
 
-    log "Step 1/2: preview (dry-run)"
-    run_sub_minimal --dry-run --prune-stale-snapshots --prune-duplicates
+    # 1) Silent dry-run analysis in JSON mode (no jq dependency)
+    build_common_flags_minimal
+    local json_output
+    json_output="$(SCRUB_GHOST_NO_MENU=1 bash "$0" --no-menu \
+      --dry-run --json --no-color --log-file /dev/null \
+      --prune-duplicates --prune-stale-snapshots --prune-uninstalled \
+      "${COMMON_FLAGS[@]}" 2>/dev/null || true)"
+
+    # 2) Parse summary integers
+    local n_ghost n_stale n_dupe n_uninstall
+    n_ghost="$(json_summary_int "$json_output" ghost)"
+    n_stale="$(json_summary_int "$json_output" stale_snapshot)"
+    n_dupe="$(json_summary_int "$json_output" duplicate_found)"
+    n_uninstall="$(json_summary_int "$json_output" uninstalled_kernel)"
 
     log ""
-    log "Type FIX to apply the recommended cleanup (safe move + backups):"
-    log "(or type 'u' to also prune uninstalled-kernel entries; requires extra confirmation)"
-    log "(or type 'b' to go back)"
+    log "${C_BOLD}Analysis Results & Recommendations:${C_RESET}"
+    log "---------------------------------------------------"
+    log " 1. Ghost Entries:       $(recommend_action "$n_ghost" ghost)"
+    log " 2. Duplicate Entries:   $(recommend_action "$n_dupe" duplicate)"
+    log " 3. Stale Snapshots:     $(recommend_action "$n_stale" stale)"
+    log " 4. Uninstalled Kernels: $(recommend_action "$n_uninstall" uninstalled)"
+    log "---------------------------------------------------"
+
+    local total_safe total_issues
+    total_safe=$((n_ghost + n_dupe))
+    total_issues=$((n_ghost + n_dupe + n_stale + n_uninstall))
+
+    if [[ "$total_issues" -eq 0 ]]; then
+      log "${C_GREEN}System is clean! No actions needed.${C_RESET}"
+      prompt_enter_to_continue
+      return 0
+    fi
+
+    log ""
+    log "Options:"
+    if [[ "$total_safe" -gt 0 ]]; then
+      log "  ${C_BOLD}FIX${C_RESET})  Apply SAFE fixes only (Ghosts + Duplicates)"
+    fi
+    log "  ${C_BOLD}ALL${C_RESET})  Apply ALL fixes (includes Stale Snapshots)"
+    log "  ${C_BOLD}K${C_RESET})    Also prune uninstalled kernels (aggressive; requires YES + --confirm-uninstalled)"
+    log "  ${C_BOLD}S${C_RESET})    View detailed dry-run output"
+    log "  ${C_BOLD}B${C_RESET})    Back"
 
     local choice
     read -r -p "> " choice </dev/tty || return 0
 
     case "$choice" in
-      b|back)
-        return 0
+      FIX|fix|F|f)
+        if [[ "$total_safe" -eq 0 ]]; then
+          log "No safe fixes available."
+          prompt_enter_to_continue
+          continue
+        fi
+
+        # Safe plan: ghosts always cleaned by --force; add duplicate pruning only if needed.
+        local -a args
+        args=(--force)
+        [[ "$n_dupe" -gt 0 ]] && args+=(--prune-duplicates)
+
+        run_sub_minimal "${args[@]}"
+        prompt_enter_to_continue
         ;;
-      u|U)
-        log "Type YES to also prune uninstalled-kernel entries:";
+
+      ALL|all|A|a)
+        # Includes stale snapshots (more aggressive). Only include flags that are relevant.
+        local -a args
+        args=(--force)
+        [[ "$n_dupe" -gt 0 ]] && args+=(--prune-duplicates)
+        [[ "$n_stale" -gt 0 ]] && args+=(--prune-stale-snapshots)
+
+        run_sub_minimal "${args[@]}"
+        prompt_enter_to_continue
+        ;;
+
+      K|k)
+        log "${C_RED}WARNING:${C_RESET} This can remove entries for kernels where modules are missing."
+        if command -v rpm >/dev/null 2>&1; then
+          log "RPM database is available; the script already avoids pruning when it cannot determine kver."
+        else
+          warn "rpm not found; proceeding without RPM double-check (conservative safeguards still apply)."
+        fi
+
+        log "Type YES to confirm pruning uninstalled kernels:" 
         local yn
         read -r -p "> " yn </dev/tty || true
         if [[ "$yn" == "YES" ]]; then
-          run_sub_minimal --force --prune-stale-snapshots --prune-duplicates --prune-uninstalled --confirm-uninstalled
+          run_sub_minimal --force --prune-duplicates --prune-stale-snapshots --prune-uninstalled --confirm-uninstalled
         else
-          log "Cancelled uninstalled-kernel pruning."
+          log "Cancelled."
         fi
         prompt_enter_to_continue
         ;;
-      FIX)
-        run_sub_minimal --force --prune-stale-snapshots --prune-duplicates
+
+      S|s)
+        run_sub_minimal --dry-run --prune-duplicates --prune-stale-snapshots --prune-uninstalled
         prompt_enter_to_continue
         ;;
+
+      B|b|back)
+        return 0
+        ;;
+
       *)
-        log "Cancelled."
+        log "Invalid option."
         prompt_enter_to_continue
         ;;
     esac
