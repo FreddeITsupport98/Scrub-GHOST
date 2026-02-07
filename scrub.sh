@@ -2082,6 +2082,64 @@ check_boot_storage_health() {
   fi
 }
 
+initrd_mime_type() {
+  local p="$1"
+  command -v file >/dev/null 2>&1 || return 1
+  file --brief --mime-type -- "$p" 2>/dev/null || true
+}
+
+initrd_looks_valid() {
+  # Best-effort: initrds should look like an "application/*" payload (gzip/zstd/cpio/etc).
+  # This catches cases where the initrd file exists but is obviously not a real archive.
+  local p="$1"
+  [[ -n "$p" && -s "$p" ]] || return 1
+
+  if command -v file >/dev/null 2>&1; then
+    local mt
+    mt="$(initrd_mime_type "$p")"
+    [[ -n "$mt" && "$mt" == application/* ]]
+    return $?
+  fi
+
+  # If file(1) isn't available, treat as OK if it exists+non-empty.
+  return 0
+}
+
+check_kernel_redundancy() {
+  # Count how many unique kernel versions have at least one valid BLS entry.
+  # We only count entries where the kernel file resolves and exists on disk.
+  declare -A valid_kvers
+  local f
+  for f in "$ENTRIES_DIR"/*.conf; do
+    [[ -e "$f" ]] || continue
+
+    local kp
+    kp="$(bls_linux_path "$f")"
+    [[ -n "$kp" ]] || continue
+
+    local kfull
+    kfull="$(resolve_boot_path "$kp" 2>/dev/null || true)"
+    [[ -n "$kfull" && -s "$kfull" ]] || continue
+
+    local kv
+    kv="$(kernel_version_from_linux_path "$kp" 2>/dev/null || true)"
+    [[ -n "$kv" ]] && valid_kvers["$kv"]=1
+  done
+
+  local count="${#valid_kvers[@]}"
+
+  if [[ "$count" -lt 2 ]]; then
+    printf '%bCRITICAL (Only %d valid kernel)%b' "$C_RED" "$count" "$C_RESET"
+    return 2
+  elif [[ "$count" -eq 2 ]]; then
+    printf '%bMINIMAL (%d kernels)%b' "$C_YELLOW" "$count" "$C_RESET"
+    return 1
+  else
+    printf '%bHEALTHY (%d kernels)%b' "$C_GREEN" "$count" "$C_RESET"
+    return 0
+  fi
+}
+
 scan_orphaned_files() {
   # Reports orphaned kernel-ish images under BOOT_DIR that are not referenced by any current BLS entry.
   # Output: "None" or "<count> files (~<mb>MB)"
@@ -2153,6 +2211,55 @@ scan_orphaned_files() {
   fi
 }
 
+scan_repairable_entries() {
+  # Scans for entries where kernel exists but one or more initrds are missing/invalid.
+  # Prints suggested dracut commands (one per kver), or nothing.
+  declare -A seen_kver
+
+  local f
+  for f in "$ENTRIES_DIR"/*.conf; do
+    [[ -e "$f" ]] || continue
+
+    local kp
+    kp="$(bls_linux_path "$f")"
+    [[ -n "$kp" ]] || continue
+
+    local kfull
+    kfull="$(resolve_boot_path "$kp" 2>/dev/null || true)"
+    [[ -n "$kfull" && -s "$kfull" ]] || continue
+
+    declare -a ips
+    ips=()
+    mapfile -t ips < <(bls_initrd_paths "$f")
+
+    # If no initrds are specified, don't guess; skip.
+    (( ${#ips[@]} > 0 )) || continue
+
+    local missing=false
+    local ip ifull
+    for ip in "${ips[@]}"; do
+      [[ -n "$ip" ]] || continue
+      ifull="$(resolve_boot_path "$ip" 2>/dev/null || true)"
+      if [[ -z "$ifull" || ! -s "$ifull" ]]; then
+        missing=true
+        continue
+      fi
+      if ! initrd_looks_valid "$ifull"; then
+        missing=true
+      fi
+    done
+
+    if [[ "$missing" == true ]]; then
+      local kver
+      kver="$(kernel_version_from_linux_path "$kp" 2>/dev/null || true)"
+      if [[ -n "$kver" && -z "${seen_kver[$kver]+x}" ]]; then
+        seen_kver["$kver"]=1
+        printf 'sudo dracut --force --kver %s\n' "$kver"
+      fi
+    fi
+  done
+}
+
 json_summary_int() {
   # $1=json $2=key -> prints integer (or 0)
   local json="$1"
@@ -2190,6 +2297,11 @@ menu_auto_fix() {
     storage_status="$(check_boot_storage_health)"
     storage_rc=$?
 
+    # 0b) Sysadmin safety: kernel redundancy (spare tire check)
+    local redundancy_status redundancy_rc
+    redundancy_status="$(check_kernel_redundancy)"
+    redundancy_rc=$?
+
     # 1) Silent dry-run analysis in JSON mode (no jq dependency)
     build_common_flags_minimal
     local json_output
@@ -2209,6 +2321,7 @@ menu_auto_fix() {
     log "${C_BOLD}Analysis Results & Recommendations:${C_RESET}"
     log "---------------------------------------------------"
     log " 0. Boot Storage:        $storage_status"
+    log " 0. Boot Redundancy:     $redundancy_status"
     log " 1. Ghost Entries:       $(recommend_action "$n_ghost" ghost)"
     local orphans
     orphans="$(scan_orphaned_files 2>/dev/null || printf 'None\n')"
@@ -2219,12 +2332,31 @@ menu_auto_fix() {
     log " 5. Orphaned Images:     ${C_YELLOW}${orphans}${C_RESET}"
     log "---------------------------------------------------"
 
+    if [[ "$redundancy_rc" -eq 2 ]]; then
+      warn "Boot redundancy is CRITICAL (only one valid kernel). Avoid aggressive cleanup until you install/keep a fallback kernel."
+    elif [[ "$redundancy_rc" -eq 1 ]]; then
+      warn "Boot redundancy is MINIMAL (two kernels). Consider keeping at least one extra fallback before aggressive cleanup."
+    fi
+
     if [[ "$storage_rc" -eq 2 && "$n_uninstall" -gt 0 ]]; then
       warn "Boot storage is CRITICAL; consider option 'K' to prune uninstalled-kernel entries (aggressive)."
     fi
     if [[ "$orphans" != "None" ]]; then
       log "${C_DIM}Tip: Orphaned images are files in BOOT_DIR with no menu entry.${C_RESET}"
       log "${C_DIM}     To reclaim space, consider: ${C_BOLD}sudo zypper purge-kernels${C_RESET}${C_DIM} (review first).${C_RESET}"
+    fi
+
+    # Mechanic advisor: propose repairs for entries with valid kernel but missing/corrupt initrd.
+    local repair_suggestions
+    repair_suggestions="$(scan_repairable_entries 2>/dev/null || true)"
+    if [[ -n "$repair_suggestions" ]]; then
+      log ""
+      log "${C_YELLOW}SMART REPAIR:${C_RESET} Found valid kernels with missing/corrupt initrds."
+      log "Instead of deleting those entries, you can attempt to repair initrds with:"
+      while IFS= read -r cmd; do
+        [[ -n "$cmd" ]] || continue
+        log "  ${C_DIM}$cmd${C_RESET}"
+      done <<<"$repair_suggestions"
     fi
 
     local total_safe total_issues
@@ -2258,6 +2390,17 @@ menu_auto_fix() {
           continue
         fi
 
+        if [[ "$redundancy_rc" -eq 2 ]]; then
+          warn "Redundancy is CRITICAL. Type YES to continue anyway:"
+          local yn
+          read -r -p "> " yn </dev/tty || true
+          if [[ "$yn" != "YES" ]]; then
+            log "Cancelled."
+            prompt_enter_to_continue
+            continue
+          fi
+        fi
+
         # Safe plan: ghosts always cleaned by --force; add duplicate pruning only if needed.
         local -a args
         args=(--force)
@@ -2271,6 +2414,17 @@ menu_auto_fix() {
         ;;
 
       ALL|all|A|a)
+        if [[ "$redundancy_rc" -eq 2 ]]; then
+          warn "Redundancy is CRITICAL. Type YES to continue anyway:"
+          local yn
+          read -r -p "> " yn </dev/tty || true
+          if [[ "$yn" != "YES" ]]; then
+            log "Cancelled."
+            prompt_enter_to_continue
+            continue
+          fi
+        fi
+
         # Includes stale snapshots (more aggressive). Only include flags that are relevant.
         local -a args
         args=(--force)
@@ -2285,6 +2439,17 @@ menu_auto_fix() {
         ;;
 
       K|k)
+        if [[ "$redundancy_rc" -eq 2 ]]; then
+          warn "Redundancy is CRITICAL. Type YES to continue anyway:"
+          local yn
+          read -r -p "> " yn </dev/tty || true
+          if [[ "$yn" != "YES" ]]; then
+            log "Cancelled."
+            prompt_enter_to_continue
+            continue
+          fi
+        fi
+
         log "${C_RED}WARNING:${C_RESET} This can remove entries for kernels where modules are missing."
         if command -v rpm >/dev/null 2>&1; then
           log "RPM database is available; the script already avoids pruning when it cannot determine kver."
@@ -3553,6 +3718,16 @@ for entry in "$ENTRIES_DIR"/*.conf; do
         missing_initrd=true
         if [[ "$VERBOSE" == true ]]; then
           log "        missing initrd: $ip"
+        fi
+      else
+        # Smart format validation: if initrd exists but doesn't look like an archive,
+        # treat it as corrupt/missing.
+        if ! initrd_looks_valid "$initrd_full"; then
+          local file_type
+          file_type="$(initrd_mime_type "$initrd_full" 2>/dev/null || true)"
+          [[ -z "$file_type" ]] && file_type="unknown"
+          log "${C_RED}[CORRUPT-INITRD]${C_RESET} $(basename -- "$entry") ${C_DIM}(invalid type: $file_type)${C_RESET}"
+          missing_initrd=true
         fi
       fi
     done

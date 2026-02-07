@@ -43,7 +43,9 @@ Recommended for most users:
 
 Smart behavior highlights:
 - Shows **boot storage health** (useful when /boot or ESP is full).
+- Shows **boot redundancy** (how many unique kernel versions have at least one bootable BLS entry). If you only have 1, Smart Auto-Fix will require an extra confirmation.
 - Shows an **orphaned images** estimate (kernel/initrd files in `BOOT_DIR` that are not referenced by any current BLS entry).
+- Offers **Smart Repair** suggestions when it finds entries where the kernel exists but the initrd is missing/corrupt (suggested `dracut --force --kver ...`).
 - After applying a fix, it automatically **re-scans** to verify the counts dropped.
 - Duplicate detection uses a two-pass index so it keeps the “best” candidate automatically (prefers protected snapshot/kernel/default entries; otherwise keeps the newest mtime).
 - If a kernel image is detected as corrupt (0 bytes **or** RPM checksum mismatch) and it is owned by an RPM, the tool suggests a repair command (`zypper in -f <pkg>`).
@@ -263,6 +265,7 @@ Remove hook:
 - Ghost/broken entry detection checks not only the `linux` path but also `initrd` (if present) and `devicetree` (if present). If any referenced file is missing, the entry is flagged as a ghost/broken entry. If an entry has multiple `initrd` lines, **all** initrds must exist.
 - **Quoted values:** BLS allows quoted values containing spaces (e.g. `linux "/EFI/My Folder/linux.efi"`). The parser supports this for path-like keys.
 - **Corruption detection:** a kernel file that exists but is **0 bytes** is treated as broken (common when the ESP runs out of space). If the kernel file is owned by an RPM package, the tool also runs a lightweight `rpm -Vf` check and flags **checksum mismatches** as corrupt (`CORRUPT-CSUM`).
+- **Initrd X-Ray:** if `file(1)` is available, initrds are also sanity-checked by MIME type. If an initrd exists but doesn’t look like an `application/*` archive payload, the entry is flagged as broken (`CORRUPT-INITRD`).
 - **Auditing:** when the tool moves/deletes entries, it also writes best-effort audit lines to the system journal via `logger` (tag: `scrub-ghost`).
 - **Kernel version parsing:** the tool understands both sd-boot style paths (`/distro/<kver>/...`) and flat BLS/GRUB-style paths (`/vmlinuz-<kver>`). If it cannot confidently determine a kernel version, it will avoid classifying entries as `UNINSTALLED-KERNEL` (too risky) and will report that the modules check was skipped.
 - **Kernel protection matching:** protection checks avoid substring false positives (e.g. `6.8.1` will not accidentally match `6.8.10`).
