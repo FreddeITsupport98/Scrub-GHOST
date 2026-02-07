@@ -2340,6 +2340,8 @@ protected_kernel_count=0
 critical_kernel_count=0
 stale_snapshot_count=0
 uninstalled_kernel_count=0
+unknown_kver_count=0
+
 duplicate_found_count=0
 duplicate_pruned_count=0
 moved_or_deleted_count=0
@@ -2508,6 +2510,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
   snap_present=false
   kver=""
   modules_present=true
+  modules_kver_unknown=false
   is_running_kernel=false
   is_latest_kernel=false
 
@@ -2568,6 +2571,7 @@ for entry in "$ENTRIES_DIR"/*.conf; do
 
   # Kernel modules verification (helps detect entries for kernels not installed anymore)
   modules_present=true
+  modules_kver_unknown=false
   if [[ "$VERIFY_KERNEL_MODULES" == true ]]; then
     if [[ -n "$kver" ]]; then
       if ! modules_dir_exists_for_kver "$kver"; then
@@ -2575,7 +2579,10 @@ for entry in "$ENTRIES_DIR"/*.conf; do
       fi
     else
       # Unknown kver: do not classify as "uninstalled kernel" (too risky).
+      # Count it so the summary can report that module verification was skipped.
       modules_present=true
+      modules_kver_unknown=true
+      unknown_kver_count=$((unknown_kver_count + 1))
     fi
   fi
 
@@ -2741,13 +2748,28 @@ for entry in "$ENTRIES_DIR"/*.conf; do
       [[ "$is_latest_kernel" == true ]] && prot_reason+="latest "
       log "${C_BLUE}[PROTECTED]${C_RESET} $(basename -- "$entry") ${C_DIM}(${prot_reason}kernel: ${entry_kver:-unknown})${C_RESET}"
       protected_kernel_count=$((protected_kernel_count + 1))
-      json_add_result "$(basename -- "$entry")" "PROTECTED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "NONE" "${prot_reason}kernel"
+      local details
+      details="${prot_reason}kernel"
+      if [[ "$modules_kver_unknown" == true ]]; then
+        details+="; kver unknown (modules check skipped)"
+      fi
+      json_add_result "$(basename -- "$entry")" "PROTECTED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "NONE" "$details"
     else
       log "${C_GREEN}[OK]${C_RESET}   $(basename -- "$entry")"
       if [[ "$is_running_kernel" == true || "$is_latest_kernel" == true ]]; then
-        json_add_result "$(basename -- "$entry")" "PROTECTED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "NONE" "kernel protected"
+        local details
+        details="kernel protected"
+        if [[ "$modules_kver_unknown" == true ]]; then
+          details+="; kver unknown (modules check skipped)"
+        fi
+        json_add_result "$(basename -- "$entry")" "PROTECTED-KERNEL" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "NONE" "$details"
       else
-        json_add_result "$(basename -- "$entry")" "OK" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "NONE" ""
+        local details
+        details=""
+        if [[ "$modules_kver_unknown" == true ]]; then
+          details="kver unknown (modules check skipped)"
+        fi
+        json_add_result "$(basename -- "$entry")" "OK" "$kernel_path" "$initrd_path" "$devicetree_path" "${snap_num:-}" "${entry_kver:-}" "NONE" "$details"
       fi
     fi
     ok_count=$((ok_count + 1))
@@ -2862,6 +2884,9 @@ log "   Protected kernels:    $protected_kernel_count"
 log "   Critical kernels:     $critical_kernel_count"
 log "   Stale snapshots:      $stale_snapshot_count"
 log "   Uninstalled kernels:  $uninstalled_kernel_count"
+if [[ "$unknown_kver_count" -gt 0 ]]; then
+  log "   Unknown kver:         $unknown_kver_count (modules check skipped)"
+fi
 log "   Duplicates found:     $duplicate_found_count"
 log "   Duplicates pruned:    $duplicate_pruned_count"
 log "   Skipped (malformed):  $skipped_count"
