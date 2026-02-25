@@ -3,6 +3,8 @@
 # Scrub-GHOST
 `scrub-ghost` is a safety-focused maintenance tool for Boot Loader Specification (BLS) entry cleanup on openSUSE (commonly `sd-boot` with entries under `/boot/efi/loader/entries`).
 
+[**This tool is now discontinued and merged with Zypper Auto Repo!**](https://github.com/FreddeITsupport98/zypper-automatik-helper-)
+
 It is designed to remove or quarantine *obviously stale* boot menu entries ("ghost" entries, stale snapper snapshots, etc.) while avoiding the common failure mode of deleting something you still need.
 
 This repository provides:
